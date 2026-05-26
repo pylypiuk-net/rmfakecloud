@@ -12,6 +12,7 @@ See the [project documentation](https://ddvk.github.io/rmfakecloud/) for setup a
 | reMarkable 2         | ✅           |
 | reMarkable Paper Pro | ✅           |
 | reMarkable Paper Pro Move | ✅           |
+| reMarkable Paper Pure| ✅           |
 
 The current release of rmfakecloud supports file synchronization up to **reMarkable software 3.27.1**. Newer releases have not been tested yet.
 
