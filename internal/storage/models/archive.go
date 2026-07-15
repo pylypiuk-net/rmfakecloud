@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/ddvk/rmfakecloud/internal/storage"
@@ -65,9 +66,44 @@ func ArchiveFromHashDoc(doc *HashDoc, rs RemoteStorage) (*exporter.MyArchive, er
 		}
 	}
 
-	for _, p := range a.Content.Pages {
-		if hash, ok := pageMap[p]; ok {
-			log.Debug("page ", hash)
+	// If the content file has a pages list, use it to match .rm files by UUID.
+	// If pages is empty (e.g. Quick Sheets where only pageCount is set),
+	// fall back to using all .rm files from the pageMap, sorted by name.
+	if len(a.Content.Pages) > 0 {
+		for _, p := range a.Content.Pages {
+			if hash, ok := pageMap[p]; ok {
+				log.Debug("page ", hash)
+				reader, err := rs.GetReader(hash)
+				if err != nil {
+					return nil, err
+				}
+				pageBin, err := io.ReadAll(reader)
+				if err != nil {
+					return nil, err
+				}
+				rmpage := rm.New()
+				err = rmpage.UnmarshalBinary(pageBin)
+				if err != nil {
+					return nil, err
+				}
+
+				page := archive.Page{
+					Data:     rmpage,
+					Pagedata: "Blank",
+				}
+				a.Pages = append(a.Pages, page)
+			}
+		}
+	} else {
+		// Fallback: no pages list in content file, use all .rm files
+		pageNames := make([]string, 0, len(pageMap))
+		for name := range pageMap {
+			pageNames = append(pageNames, name)
+		}
+		sort.Strings(pageNames)
+		for _, name := range pageNames {
+			hash := pageMap[name]
+			log.Debug("page (fallback) ", hash)
 			reader, err := rs.GetReader(hash)
 			if err != nil {
 				return nil, err
