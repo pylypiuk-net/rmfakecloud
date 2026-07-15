@@ -192,11 +192,12 @@ func (app *ReactAppWrapper) oidcCallbackHandler(c *gin.Context) {
 	var userInfo struct {
 		Sub   string `json:"sub"`
 		Email string `json:"email"`
-		Name  string `json:"name"`
+		Name             string `json:"name"`
+		PreferredUsername string `json:"preferred_username"`
 	}
 	json.Unmarshal(userBody, &userInfo)
 
-	log.Info("[oidc] userinfo: sub=", userInfo.Sub, " email=", userInfo.Email, " name=", userInfo.Name)
+	log.Info("[oidc] userinfo: sub=", userInfo.Sub, " email=", userInfo.Email, " name=", userInfo.Name, " preferred_username=", userInfo.PreferredUsername)
 
 	// Link to existing user by email (sanitized, same as model.NewUser)
 	userID := sanitizeEmail(userInfo.Email)
@@ -207,6 +208,25 @@ func (app *ReactAppWrapper) oidcCallbackHandler(c *gin.Context) {
 	}
 
 	user, err := app.userStorer.GetUser(userID)
+
+	// Fallback: if email lookup failed, try matching by Authentik username.
+	// This handles users created with a bare username (e.g. "ypyly") rather than an email.
+	// Try "preferred_username" first (standard OIDC claim), then "name" (Authentik username).
+	if (err != nil || user == nil) {
+		fallbackIDs := []string{userInfo.PreferredUsername, userInfo.Name}
+		for _, fid := range fallbackIDs {
+			if fid == "" {
+				continue
+			}
+			log.Info("[oidc] email lookup failed, trying username fallback: ", fid)
+			user, err = app.userStorer.GetUser(fid)
+			if err == nil && user != nil {
+				log.Info("[oidc] user found via username fallback: ", fid)
+				break
+			}
+		}
+	}
+
 	if err != nil || user == nil {
 		// User not found
 		if oidc.AutoCreate {
