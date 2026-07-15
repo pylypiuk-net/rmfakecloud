@@ -86,7 +86,17 @@ func (app *ReactAppWrapper) oidcLoginHandler(c *gin.Context) {
 		"&code_challenge_method=S256"
 
 	log.Info("[oidc] redirecting to: ", oidc.Issuer, "/application/o/authorize/")
-	c.Redirect(http.StatusFound, authURL)
+
+	// Use a 200 HTML page with a meta-refresh redirect instead of a 302.
+	// This ensures cookies are saved by the browser before the cross-site
+	// navigation to Authentik. Some browsers (especially in incognito mode)
+	// drop cookies set on a 302 response that redirects cross-site.
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.String(http.StatusOK, `<!DOCTYPE html>
+<html>
+<head><meta http-equiv="refresh" content="0; url=%s"></head>
+<body>Redirecting to authentication provider...</body>
+</html>`, authURL)
 }
 
 // oidcCallbackHandler handles the OIDC callback: token exchange, user
