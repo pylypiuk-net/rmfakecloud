@@ -66,11 +66,21 @@ func ArchiveFromHashDoc(doc *HashDoc, rs RemoteStorage) (*exporter.MyArchive, er
 		}
 	}
 
-	// If the content file has a pages list, use it to match .rm files by UUID.
-	// If pages is empty (e.g. Quick Sheets where only pageCount is set),
-	// fall back to using all .rm files from the pageMap, sorted by name.
-	if len(a.Content.Pages) > 0 {
-		for _, p := range a.Content.Pages {
+	// Build ordered page list:
+	// 1. If cPages is populated (firmware 3.0+, Quick Sheets), use that order
+	// 2. If the old pages list is populated, use it
+	// 3. Otherwise, fall back to all .rm files sorted by name
+	var orderedPageIDs []string
+	if a.Content.CPagesData != nil && len(a.Content.CPagesData.Pages) > 0 {
+		for _, p := range a.Content.CPagesData.Pages {
+			orderedPageIDs = append(orderedPageIDs, p.ID)
+		}
+	} else if len(a.Content.Pages) > 0 {
+		orderedPageIDs = append(orderedPageIDs, a.Content.Pages...)
+	}
+
+	if len(orderedPageIDs) > 0 {
+		for _, p := range orderedPageIDs {
 			if hash, ok := pageMap[p]; ok {
 				log.Debug("page ", hash)
 				reader, err := rs.GetReader(hash)

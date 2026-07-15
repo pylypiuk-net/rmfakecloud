@@ -20,7 +20,7 @@ const (
 	DeviceHeight = 1872
 )
 
-var rmPageSize = creator.PageSize{445, 594}
+var rmPageSize = creator.PageSize{595, 842} // A4 portrait
 
 type PdfGenerator struct {
 	options   PdfGeneratorOptions
