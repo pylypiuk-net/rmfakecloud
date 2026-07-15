@@ -168,8 +168,6 @@ github.com/jstemmer/go-junit-report v0.9.1/go.mod h1:Brl9GWCQeLvo8nXZwPNNblvFj/X
 github.com/jung-kurt/gofpdf v1.0.0/go.mod h1:7Id9E/uU8ce6rXgefFLlgrJj/GYY22cpxn+r32jIOes=
 github.com/jung-kurt/gofpdf v1.16.2 h1:jgbatWHfRlPYiK85qgevsZTHviWXKwB1TTiKdz5PtRc=
 github.com/jung-kurt/gofpdf v1.16.2/go.mod h1:1hl7y57EsiPAkLbOwzpzqgx1A30nQCk/YmFV8S2vmK0=
-github.com/juruen/rmapi v0.0.25 h1:9i9LhzWBtSKRuhgzLWK5X013kNzb+X5rd+0WM5eHbC0=
-github.com/juruen/rmapi v0.0.25/go.mod h1:w3sRs3dEsPenlZJec2x1iy9EGeKzIAAMrPeZ+iBDEnA=
 github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
 github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
 github.com/klauspost/cpuid/v2 v2.2.7 h1:ZWSB3igEs+d0qvnxR/ZBzXVmxkgt8DdzP6m9pfuVLDM=
@@ -206,6 +204,8 @@ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZN
 github.com/poundifdef/go-remarkable2pdf v0.2.0 h1:WDRh/ZBkpEOLPLj3lVfoHrQpyVkOQv2A3XOpViRZ0mE=
 github.com/poundifdef/go-remarkable2pdf v0.2.0/go.mod h1:TOdRSCI0lBdlWmGsAQzc4jVGKqhqUJdeREKVSrHGCQg=
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
+github.com/pylypiuk-net/rmapi v0.0.25-v6 h1:o/EV6Xk08cLmx6QN9gUMxNOMgTvub3uRJ24YgFZkmo8=
+github.com/pylypiuk-net/rmapi v0.0.25-v6/go.mod h1:2AkWw/FUrvTY+3qX5UGCCnNI38tiN4mcKWaCYQM7gqY=
 github.com/rifflock/lfshook v0.0.0-20180920164130-b9218ef580f5 h1:mZHayPoR0lNmnHyvtYjDeq0zlVHn9K/ZXoy17ylucdo=
 github.com/rifflock/lfshook v0.0.0-20180920164130-b9218ef580f5/go.mod h1:GEXHk5HgEKCvEIIrSpFI3ozzG5xOKA2DVlEX/gGnewM=
 github.com/rogpeppe/go-internal v1.3.0/go.mod h1:M8bDsm7K2OlrFYOpmOWEs/qY81heoFRclV5y23lUDJ4=

@@ -4,6 +4,8 @@ go 1.23.3
 
 toolchain go1.24.1
 
+replace github.com/juruen/rmapi => github.com/pylypiuk-net/rmapi v0.0.25-v6
+
 require (
 	github.com/apognu/gocal v0.9.1
 	github.com/danjacques/gofslock v0.0.0-20240212154529-d899e02bfe22
