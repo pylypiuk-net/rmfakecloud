@@ -43,14 +43,18 @@ export default function FileViewer({ file, onSelect }) {
   };
 	const parent = useRef(null);
 	useEffect(() => {
-		const resizeObserver = new ResizeObserver((event) => {
-			// Fit the PDF page to the container width so portrait pages
-			// fill horizontally and scale height proportionally.
-			setWidth(event[0].contentBoxSize[0].inlineSize);
+		const el = parent.current;
+		if (!el) return;
+		const resizeObserver = new ResizeObserver((entries) => {
+			const entry = entries[0];
+			const w = entry.contentBoxSize
+				? (Array.isArray(entry.contentBoxSize) ? entry.contentBoxSize[0].inlineSize : entry.contentBoxSize.inlineSize)
+				: entry.contentRect.width;
+			setWidth(w);
 		});
-
-		resizeObserver.observe(parent.current);
-	});
+		resizeObserver.observe(el);
+		return () => resizeObserver.disconnect();
+	}, [file]);
 
   // TODO: add loading and error handling
   const triggerDownload = (blob, filename) => {
@@ -115,7 +119,7 @@ export default function FileViewer({ file, onSelect }) {
 
 
       {file && (
-        <div ref={parent} style={{height: "95%"}}>
+        <div ref={parent} style={{height: "95%", width: "100%", display: "flex", justifyContent: "center", overflow: "auto"}}>
 		  <Document file={downloadUrl} onLoadSuccess={onLoadSuccess} options={options}>
             <Page pageNumber={page} 
 							width={ width } 
