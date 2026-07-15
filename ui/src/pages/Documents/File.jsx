@@ -26,8 +26,7 @@ export default function FileViewer({ file, onSelect }) {
 
   const [page, setPage] = useState(1);
   const [pages, setPages] = useState(1);
-  // const [width, setWidth] = useState(100);
-  const [height, setHeight] = useState(100);
+  const [width, setWidth] = useState(100);
   const onLoadSuccess = (pdf) => {
     setPage(1);
     setPages(pdf.numPages);
@@ -45,10 +44,9 @@ export default function FileViewer({ file, onSelect }) {
 	const parent = useRef(null);
 	useEffect(() => {
 		const resizeObserver = new ResizeObserver((event) => {
-			// Depending on the layout, you may need to swap inlineSize with blockSize
-			// https://developer.mozilla.org/en-US/docs/Web/API/ResizeObserverEntry/contentBoxSize
-			// setWidth(event[0].contentBoxSize[0].inlineSize);
-			setHeight(event[0].contentBoxSize[0].blockSize);
+			// Fit the PDF page to the container width so portrait pages
+			// fill horizontally and scale height proportionally.
+			setWidth(event[0].contentBoxSize[0].inlineSize);
 		});
 
 		resizeObserver.observe(parent.current);
@@ -120,8 +118,7 @@ export default function FileViewer({ file, onSelect }) {
         <div ref={parent} style={{height: "95%"}}>
 		  <Document file={downloadUrl} onLoadSuccess={onLoadSuccess} options={options}>
             <Page pageNumber={page} 
-							// width={ width } 
-							height={ height} 
+							width={ width } 
 							renderAnnotationLayer={false} 
 							renderTextLayer={false}
 						/>
