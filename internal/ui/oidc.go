@@ -295,19 +295,27 @@ func (app *ReactAppWrapper) oidcCallbackHandler(c *gin.Context) {
 		return
 	}
 
-	// Set the same auth cookie as local login
-	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(cookieName, tokenString, int(expiresAfter.Seconds()), "/", "", app.cfg.HTTPSCookie, true)
-
 	log.Info("[oidc] login successful, user: ", user.ID)
 
-	// Redirect to returnTo or /
+	// Clear the redirect cookie
 	returnTo, _ := c.Cookie(oidcRedirectCookie)
 	if returnTo == "" {
 		returnTo = "/"
 	}
 	c.SetCookie(oidcRedirectCookie, "", -1, "/", "", secure, true)
-	c.Redirect(http.StatusFound, returnTo)
+
+	// Set the same auth cookie as local login
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(cookieName, tokenString, int(expiresAfter.Seconds()), "/", "", app.cfg.HTTPSCookie, true)
+
+	// Redirect to /login with the token so the SPA can store it in localStorage.
+	// The SPA uses localStorage for auth state, not cookies — so we pass the token
+	// as a query param and the Login component captures it before redirecting to /.
+	redirectURL := "/login?oidc_token=" + tokenString
+	if returnTo != "/" {
+		redirectURL += "&returnTo=" + url.QueryEscape(returnTo)
+	}
+	c.Redirect(http.StatusFound, redirectURL)
 }
 
 // sanitizeEmail sanitizes an email to match model.sanitizeEmail (same regex).

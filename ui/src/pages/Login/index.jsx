@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useHistory, useLocation } from "react-router-dom";
 import { Button, Form } from "react-bootstrap";
+import { jwtDecode } from "jwt-decode";
 
 import { useAuthState } from "../../common/useAuthContext";
 import { loginUser } from "../../common/actions";
@@ -24,6 +25,26 @@ const Login = () => {
       setOidcError(decodeURIComponent(error));
     }
   }, [location.search]);
+
+  // Capture OIDC token from callback redirect
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const oidcToken = params.get("oidc_token");
+    if (oidcToken) {
+      // Store the JWT in localStorage (same as local login)
+      try {
+        const user = jwtDecode(oidcToken);
+        localStorage.setItem("currentUser", JSON.stringify(user));
+        localStorage.setItem("authToken", oidcToken);
+        // Redirect to returnTo or /documents
+        const returnTo = params.get("returnTo") || "/";
+        history.push(returnTo);
+      } catch (e) {
+        console.error("Failed to decode OIDC token:", e);
+        setOidcError("jwt_failed");
+      }
+    }
+  }, [location.search, history]);
 
   // Check if OIDC is enabled
   useEffect(() => {
