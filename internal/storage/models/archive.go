@@ -67,12 +67,22 @@ func ArchiveFromHashDoc(doc *HashDoc, rs RemoteStorage) (*exporter.MyArchive, er
 	}
 
 	// Build ordered page list:
-	// 1. If cPages is populated (firmware 3.0+, Quick Sheets), use that order
+	// 1. If cPages is populated (firmware 3.0+, Quick Sheets), sort by idx and skip deleted
 	// 2. If the old pages list is populated, use it
 	// 3. Otherwise, fall back to all .rm files sorted by name
 	var orderedPageIDs []string
 	if a.Content.CPagesData != nil && len(a.Content.CPagesData.Pages) > 0 {
-		for _, p := range a.Content.CPagesData.Pages {
+		// Copy and sort by idx.Value (CRDT order) to ensure correct page sequence
+		cpages := make([]archive.CPageEntry, len(a.Content.CPagesData.Pages))
+		copy(cpages, a.Content.CPagesData.Pages)
+		sort.Slice(cpages, func(i, j int) bool {
+			return cpages[i].Idx.Value < cpages[j].Idx.Value
+		})
+		for _, p := range cpages {
+			// Skip deleted pages
+			if p.Deleted != nil && p.Deleted.Value != 0 {
+				continue
+			}
 			orderedPageIDs = append(orderedPageIDs, p.ID)
 		}
 	} else if len(a.Content.Pages) > 0 {

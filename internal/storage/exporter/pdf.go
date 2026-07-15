@@ -20,7 +20,10 @@ const (
 	DeviceHeight = 1872
 )
 
-var rmPageSize = creator.PageSize{595, 842} // A4 portrait
+// Use the reMarkable's native aspect ratio (1404:1872 = 1:1.333) for the PDF
+// page size. This ensures strokes fill the entire page without whitespace.
+// Scaled to ~A4 width (595pt) for reasonable file size.
+var rmPageSize = creator.PageSize{595, 793} // 595 * 1872/1404 = 793
 
 type PdfGenerator struct {
 	options   PdfGeneratorOptions
