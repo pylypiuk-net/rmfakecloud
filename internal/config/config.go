@@ -81,6 +81,14 @@ const (
 	envMQTTPort          = "MQTT_PORT"
 	envICEServers        = "ICE_SERVERS"
 	envHashSchemaVersion = "HASH_SCHEMA_VERSION"
+
+	// OIDC (optional, env-gated)
+	envOIDCEnabled      = "OIDC_ENABLED"
+	envOIDCClientID     = "OIDC_CLIENT_ID"
+	envOIDCClientSecret = "OIDC_CLIENT_SECRET"
+	envOIDCCallbackURL  = "OIDC_CALLBACK_URL"
+	envOIDCIssuer       = "OIDC_ISSUER"
+	envOIDCAutoCreate   = "OIDC_AUTO_CREATE"
 )
 
 // Config config
@@ -106,6 +114,20 @@ type Config struct {
 	MQTTPort          string
 	ICEServers        []interface{}
 	HashSchemaVersion string
+
+	// OIDC optional configuration (env-gated, nil if not configured)
+	OIDC *OIDCConfig
+}
+
+// OIDCConfig holds optional OIDC provider settings.
+// When nil or Enabled=false, local login is the only auth method.
+type OIDCConfig struct {
+	Enabled      bool
+	ClientID     string
+	ClientSecret string
+	CallbackURL  string
+	Issuer       string
+	AutoCreate   bool
 }
 
 // Verify verify
@@ -285,6 +307,29 @@ func FromEnv() *Config {
 		ICEServers:        iceServers,
 		HashSchemaVersion: hashSchemaVersion,
 	}
+
+	// Optional OIDC
+	oidcEnabled, _ := strconv.ParseBool(os.Getenv(envOIDCEnabled))
+	if oidcEnabled {
+		oidcCfg := &OIDCConfig{
+			Enabled:      true,
+			ClientID:     os.Getenv(envOIDCClientID),
+			ClientSecret: os.Getenv(envOIDCClientSecret),
+			CallbackURL:  os.Getenv(envOIDCCallbackURL),
+			Issuer:       os.Getenv(envOIDCIssuer),
+			AutoCreate:   false,
+		}
+		if oidcCfg.Issuer == "" {
+			oidcCfg.Issuer = "https://auth.int.pylypiuk.net"
+		}
+		if oidcCfg.CallbackURL == "" {
+			oidcCfg.CallbackURL = "https://rm.int.pylypiuk.net/ui/api/oidc/callback"
+		}
+		oidcCfg.AutoCreate, _ = strconv.ParseBool(os.Getenv(envOIDCAutoCreate))
+		cfg.OIDC = oidcCfg
+		log.Info("OIDC enabled, client_id: ", oidcCfg.ClientID)
+	}
+
 	return &cfg
 }
 

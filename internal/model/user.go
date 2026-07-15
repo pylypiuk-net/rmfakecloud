@@ -125,6 +125,11 @@ func sanitizeEmail(email string) string {
 	return emailWhiteList.ReplaceAllString(email, "")
 }
 
+// SanitizeEmail exports sanitizeEmail for use by other packages (e.g. OIDC handler).
+func SanitizeEmail(email string) string {
+	return sanitizeEmail(email)
+}
+
 // NewUser create a new user object
 func NewUser(userID string, rawPassword string) (*User, error) {
 	password, err := hashPassword(rawPassword)

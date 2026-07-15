@@ -1,12 +1,33 @@
-//$background1: #211E1C;
-$background1: rgb(33,37,41);
-$background2: #0f0f0f;
+// Platform-engineering aligned dark theme
+$bg-primary: #111827;
+$bg-secondary: #1f2937;
+$bg-tertiary: #374151;
+$bg-input: #111827;
 
-$foreground1: #f8f7f6;
-$foreground2: #e8e3d9;
-$foreground3: #e4dbaf;
+$text-primary: #f9fafb;
+$text-secondary: #e5e7eb;
+$text-muted: #9ca3af;
+$text-faint: #6b7280;
 
-$action-rgb: 238, 123, 48;
-$action: #EE7B30;
-$accept: #00e676;
-$reject: #ff1744;
+$border-color: #374151;
+$border-hover: #6b7280;
+
+$accent-primary: #4b5563;
+$accent-primary-hover: #6b7280;
+$accent-danger: #dc2626;
+$accent-danger-hover: #b91c1c;
+$accent-success: #059669;
+$accent-success-hover: #047857;
+$accent-warning: #f59e0b;
+$accent-info: #3b82f6;
+
+// Legacy aliases for backward compatibility with existing components
+$background1: $bg-primary;
+$background2: $bg-input;
+$foreground1: $text-primary;
+$foreground2: $text-secondary;
+$foreground3: $text-muted;
+$action: #6b7280;
+$action-rgb: 107, 114, 128;
+$accept: #059669;
+$reject: #dc2626;

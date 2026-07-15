@@ -41,6 +41,11 @@ func (app *ReactAppWrapper) RegisterRoutes(router *gin.Engine) {
 		c.SetCookie(cookieName, "/", -1, "", "", false, true)
 		c.Status(http.StatusOK)
 	})
+
+	// OIDC (optional — only active when cfg.OIDC.Enabled is true)
+	r.GET("oidc/status", app.oidcStatusHandler)
+	r.GET("oidc/login", app.oidcLoginHandler)
+	r.GET("oidc/callback", app.oidcCallbackHandler)
 	//with authentication
 	auth := r.Group("")
 	auth.Use(app.authMiddleware())
