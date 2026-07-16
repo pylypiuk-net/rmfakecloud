@@ -50,7 +50,7 @@ export default function FileViewer({ file, onSelect }) {
 			const w = entry.contentBoxSize
 				? (Array.isArray(entry.contentBoxSize) ? entry.contentBoxSize[0].inlineSize : entry.contentBoxSize.inlineSize)
 				: entry.contentRect.width;
-			setWidth(w);
+			setWidth(w * 0.8);
 		});
 		resizeObserver.observe(el);
 		return () => resizeObserver.disconnect();
