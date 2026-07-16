@@ -19,6 +19,7 @@ export default function DocumentList() {
   const [selected, setSelected] = useState(null);
   const [term, setTerm] = useState("");
   const [showSearch, setShowSearch] = useState(false);
+  const [showTree, setShowTree] = useState(true);
   const [counter, setCounter] = useState(0);
   const [entries, setEntries] = useState([])
   const [initialSelectionSet, setInitialSelectionSet] = useState(false);
@@ -227,35 +228,41 @@ export default function DocumentList() {
   }, [entries, itemId, initialSelectionSet]);
 
   return (
-    <Container fluid style={{height: "100%", display: "flex", flexDirection: "column", overflow: "hidden", padding: "25px 0 20px 0"}}>
-        <Row style={{flex: "1 1 auto", minHeight: 0}}>
-          <Col md={4} style={{display: "flex", flexDirection: "column", height: "100%"}}>
-            <Navbar style={{flexShrink: 0}}>
-              <div className={`${styles.stretch} ${styles.userid}`}>{user.UserID}</div>
-              <Button variant="outline" onClick={() => { setShowSearch(!showSearch); setTerm("") }}><BsSearch/></Button>
-            </Navbar>
+    <Container fluid style={{height: "100%", display: "flex", flexDirection: "row", overflow: "hidden", padding: "0"}}>
+        {/* Tree panel — narrow, collapsible */}
+        <div style={{width: showTree ? "240px" : "0px", minWidth: showTree ? "240px" : "0px", transition: "width 0.2s", display: "flex", flexDirection: "column", height: "100%", borderRight: "1px solid #1f2937", overflow: "hidden"}}>
+          <Navbar style={{flexShrink: 0, padding: "8px 12px", borderBottom: "1px solid #1f2937"}}>
+            <div className={`${styles.stretch} ${styles.userid}`} style={{fontSize: "13px", color: "#9ca3af"}}>{user.UserID}</div>
+            <Button variant="outline" size="sm" onClick={() => { setShowSearch(!showSearch); setTerm("") }} style={{border: "none", padding: "4px 8px"}}><BsSearch/></Button>
+          </Navbar>
 
-            {showSearch && <div style={{flexShrink: 0}}>
-              <InputGroup className="mb-3">
-                <InputGroup.Text>
-                  <BsSearch />
-                </InputGroup.Text>
+          {showSearch && <div style={{flexShrink: 0, padding: "8px 12px"}}>
+            <InputGroup className="mb-2" size="sm">
+              <InputGroup.Text style={{background: "#111827", border: "1px solid #374151"}}>
+                <BsSearch />
+              </InputGroup.Text>
+              <Form.Control autoFocus size="sm" type="text" value={term} onChange={(e) => { setTerm(e.currentTarget.value); }} style={{background: "#111827", border: "1px solid #374151", color: "#e5e7eb"}} />
+            </InputGroup>
+          </div>}
 
-                <Form.Control autoFocus size="sm" type="text" value={term} onChange={(e) => { setTerm(e.currentTarget.value); }} />
-              </InputGroup>
-            </div>}
+          <div ref={treeContainerRef} className={styles.treeContainer} style={{flex: "1 1 auto", minHeight: 0, overflow: "auto"}}>
+            <DocumentTree selection={selected} onSelect={onSelect} treeRef={treeRef} term={term} entries={entries} height={treeHeight} />
+          </div>
+        </div>
 
-            <div ref={treeContainerRef} className={styles.treeContainer} style={{flex: "1 1 auto", minHeight: 0, overflow: "auto"}}>
-              <DocumentTree selection={selected} onSelect={onSelect} treeRef={treeRef} term={term} entries={entries} height={treeHeight} />
-            </div>
-          </Col>
-          <Col md={8} style={{display: "flex", flexDirection: "column", height: "100%"}}>
-            <div style={{flex: "1 1 auto", minHeight: 0, overflow: "auto"}}>
-              {selected && selected.isLeaf && <File file={selected} onSelect={onSelect} />}
-              {selected && !selected.isLeaf && <Folder selection={selected} onSelect={onSelect} onUpdate={onUpdate} counter={counter} />}
-            </div>
-          </Col>
-        </Row>
+        {/* Main content — document viewer gets all remaining space */}
+        <div style={{flex: "1 1 auto", display: "flex", flexDirection: "column", height: "100%", minHeight: 0}}>
+          {/* Toggle button for tree panel */}
+          <div style={{flexShrink: 0, padding: "8px 12px", borderBottom: "1px solid #1f2937", display: "flex", alignItems: "center", gap: "8px"}}>
+            <Button variant="outline" size="sm" onClick={() => setShowTree(!showTree)} style={{border: "1px solid #374151", padding: "2px 10px", fontSize: "13px"}}>
+              <i className="fas fa-bars" style={{fontSize: "12px"}}></i>
+            </Button>
+          </div>
+          <div style={{flex: "1 1 auto", minHeight: 0, overflow: "auto"}}>
+            {selected && selected.isLeaf && <File file={selected} onSelect={onSelect} />}
+            {selected && !selected.isLeaf && <Folder selection={selected} onSelect={onSelect} onUpdate={onUpdate} counter={counter} />}
+          </div>
+        </div>
     </Container>
   );
 }
