@@ -1,268 +1,72 @@
-import DocumentTree from "./Tree";
 import apiservice from "../../services/api.service"
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams, useHistory } from "react-router-dom";
-import { Container, Row, Col } from "react-bootstrap";
+import { Container } from "react-bootstrap";
 import File from "./File";
 import Folder from "./Folder";
-import Navbar from 'react-bootstrap/Navbar';
-import { BsSearch } from "react-icons/bs";
-import Form from 'react-bootstrap/Form';
-import Button from 'react-bootstrap/Button';
-import InputGroup from 'react-bootstrap/InputGroup';
-import { toast } from "react-toastify";
 import { useAuthState } from "../../common/useAuthContext";
-
-import styles from "./Documents.module.scss";
 
 export default function DocumentList() {
   const [selected, setSelected] = useState(null);
-  const [term, setTerm] = useState("");
-  const [showSearch, setShowSearch] = useState(false);
-  const [showTree, setShowTree] = useState(true);
   const [counter, setCounter] = useState(0);
-  const [entries, setEntries] = useState([])
-  const [initialSelectionSet, setInitialSelectionSet] = useState(false);
-  const [treeHeight, setTreeHeight] = useState(700);
-
   const { itemId } = useParams();
   const history = useHistory();
   const { state: { user } } = useAuthState();
 
-  const treeRef = useRef(null);
-  const treeContainerRef = useRef(null);
-  const lastSelectedId = useRef(null);
-
+  // Poll for selection from sidebar (set via window.__rmSelectedNode)
   useEffect(() => {
-    lastSelectedId.current = selected?.id || null;
+    const interval = setInterval(() => {
+      if (window.__rmSelectedNode !== selected) {
+        setSelected(window.__rmSelectedNode);
+      }
+    }, 100);
+    return () => clearInterval(interval);
   }, [selected]);
 
-  useEffect(() => {
-    if (lastSelectedId.current && treeRef.current && typeof treeRef.current.get === 'function') {
-      const node = treeRef.current.get(lastSelectedId.current);
-      if (node && node !== selected) {
-        setSelected(node);
-      }
-    }
-  }, [entries]);
-
-  const toggleNode = (node) => {
-    if (node == null) {
-      return
-    }
-    if (typeof node.toggle !== 'function') {
-      return
-    }
-
-    node.toggle()
-  }
-
-  // select from tree. node must extend NodeApi from react-arborist
   const onSelect = (node) => {
-    setSelected(node);
-    toggleNode(node);
-
-    // Update URL with selected item ID
-    if (node && node.id) {
-      // Don't add root and trash to URL, keep as /documents
-      if (node.id === 'root' || node.id === 'trash') {
-        history.push('/documents');
-      } else {
-        history.push(`/documents/${node.id}`);
-      }
+    if (window.__rmOnTreeSelect) {
+      window.__rmOnTreeSelect(node);
     }
   };
 
   const onUpdate = () => {
-    setCounter(prev => prev+1);
+    setCounter(prev => prev + 1);
+    if (window.__rmUpdateCounter) {
+      window.__rmUpdateCounter();
+    }
   };
-
-  useEffect(() => {
-    // Only auto-select first item if there's no itemId in URL
-    if (
-      !initialSelectionSet &&
-      !itemId &&
-      selected === null &&
-      treeRef.current &&
-      treeRef.current.root &&
-      treeRef.current.root.children[0]
-    ) {
-      setSelected(treeRef.current.root.children[0]);
-      setInitialSelectionSet(true);
-    }
-  }, [entries, selected, initialSelectionSet, itemId]);
-
-  useEffect(() => {
-    const resizeObserver = new ResizeObserver((event) => {
-      setTreeHeight(event[0].contentBoxSize[0].blockSize);
-    });
-
-    if (treeContainerRef.current) {
-      resizeObserver.observe(treeContainerRef.current);
-    }
-
-    return () => {
-      resizeObserver.disconnect();
-    };
-  }, []);
-
-	useEffect(() => {
-		const loadDocs = async () => {
-			const { Trash, Entries } = await apiservice.listDocument()
-
-			const root = {
-				id: "root",
-				name: "My Files",
-				isFolder: true,
-				icon: "device",
-				children: Entries,
-			}
-			const trash = {
-				id: "trash",
-				name: "Trash",
-				isFolder: true,
-				icon: "trash",
-				children: Trash,
-			}
-			setEntries([root, trash]);
-		}
-
-		loadDocs().catch(e => toast.error(e));
-	},[counter])
-
-  // Helper function to recursively search for an item by ID in the tree
-  // Returns both the item and its parent chain
-  const findItemInEntries = (entries, targetId, parent = null) => {
-    for (const entry of entries) {
-      if (entry.id === targetId) {
-        return { item: entry, parent };
-      }
-      if (entry.children && entry.children.length > 0) {
-        const found = findItemInEntries(entry.children, targetId, entry);
-        if (found) return found;
-      }
-    }
-    return null;
-  };
-
-  // Helper to build parent chain for breadcrumb
-  const buildParentChain = (parentItem) => {
-    if (!parentItem) return null;
-
-    const parentNode = {
-      id: parentItem.id,
-      data: parentItem,
-      isLeaf: !parentItem.isFolder,
-      isRoot: parentItem.id === 'root' || parentItem.id === 'trash',
-      // Add a dummy toggle function for compatibility
-      toggle: () => {},
-    };
-
-    // If this parent is not root/trash, try to find its parent
-    if (parentItem.id !== 'root' && parentItem.id !== 'trash') {
-      const grandparentResult = findItemInEntries(entries, parentItem.id);
-      if (grandparentResult && grandparentResult.parent) {
-        parentNode.parent = buildParentChain(grandparentResult.parent);
-      }
-    } else {
-      // This is root or trash - add the internal react-arborist root above it
-      parentNode.parent = {
-        id: '__REACT_ARBORIST_INTERNAL_ROOT__',
-        data: { id: '__REACT_ARBORIST_INTERNAL_ROOT__', name: '' },
-        isLeaf: false,
-        parent: null,
-      };
-    }
-
-    return parentNode;
-  };
-
-  // Handle URL navigation: restore selection from URL parameter
-  useEffect(() => {
-    // Only proceed if we have entries and an itemId
-    if (!entries.length || !itemId || initialSelectionSet) {
-      return;
-    }
-
-    // Find the item in our data
-    const result = findItemInEntries(entries, itemId);
-
-    if (!result) {
-      // Item doesn't exist in our data
-      toast.warning(`Item not found, returning to root`);
-      history.push('/documents');
-      return;
-    }
-
-    const { item: foundItem, parent: parentItem } = result;
-
-    // Create a pseudo-node object that matches what onSelect expects
-    // React-arborist wraps the data, so the node has both top-level properties
-    // and a 'data' property containing the actual item
-    const pseudoNode = {
-      id: foundItem.id,
-      data: foundItem,
-      isLeaf: !foundItem.isFolder,
-      children: (foundItem.children || []).map(child => ({
-        id: child.id,
-        data: child,
-        isLeaf: !child.isFolder,
-      })),
-      parent: parentItem ? buildParentChain(parentItem) : null,
-      isRoot: foundItem.id === 'root' || foundItem.id === 'trash',
-    };
-
-    // Set the selection directly
-    setSelected(pseudoNode);
-    setInitialSelectionSet(true);
-
-    // Try to open parent folders in the tree if possible
-    if (treeRef.current && typeof treeRef.current.openParents === 'function') {
-      // Give tree a moment to render, then open parents
-      setTimeout(() => {
-        if (treeRef.current && typeof treeRef.current.openParents === 'function') {
-          treeRef.current.openParents(itemId);
-        }
-      }, 100);
-    }
-  }, [entries, itemId, initialSelectionSet]);
 
   return (
-    <Container fluid style={{height: "100%", display: "flex", flexDirection: "row", overflow: "hidden", padding: "0"}}>
-        {/* Tree panel — narrow, collapsible */}
-        <div style={{width: showTree ? "240px" : "0px", minWidth: showTree ? "240px" : "0px", transition: "width 0.2s", display: "flex", flexDirection: "column", height: "100%", borderRight: "1px solid #1f2937", overflow: "hidden"}}>
-          <Navbar style={{flexShrink: 0, padding: "8px 12px", borderBottom: "1px solid #1f2937"}}>
-            <div className={`${styles.stretch} ${styles.userid}`} style={{fontSize: "13px", color: "#9ca3af"}}>{user.UserID}</div>
-            <Button variant="outline" size="sm" onClick={() => { setShowSearch(!showSearch); setTerm("") }} style={{border: "none", padding: "4px 8px"}}><BsSearch/></Button>
-          </Navbar>
-
-          {showSearch && <div style={{flexShrink: 0, padding: "8px 12px"}}>
-            <InputGroup className="mb-2" size="sm">
-              <InputGroup.Text style={{background: "#111827", border: "1px solid #374151"}}>
-                <BsSearch />
-              </InputGroup.Text>
-              <Form.Control autoFocus size="sm" type="text" value={term} onChange={(e) => { setTerm(e.currentTarget.value); }} style={{background: "#111827", border: "1px solid #374151", color: "#e5e7eb"}} />
-            </InputGroup>
-          </div>}
-
-          <div ref={treeContainerRef} className={styles.treeContainer} style={{flex: "1 1 auto", minHeight: 0, overflow: "auto"}}>
-            <DocumentTree selection={selected} onSelect={onSelect} treeRef={treeRef} term={term} entries={entries} height={treeHeight} />
+    <Container fluid style={{
+      height: "100%",
+      display: "flex",
+      flexDirection: "column",
+      overflow: "hidden",
+      padding: "0",
+    }}>
+      <div style={{flex: "1 1 auto", minHeight: 0, overflow: "auto"}}>
+        {selected && selected.isLeaf && <File file={selected} onSelect={onSelect} />}
+        {selected && !selected.isLeaf && (
+          <Folder
+            selection={selected}
+            onSelect={onSelect}
+            onUpdate={onUpdate}
+            counter={counter}
+          />
+        )}
+        {!selected && (
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: "100%",
+            color: "#6b7280",
+            fontSize: "14px",
+          }}>
+            Select a document from the sidebar
           </div>
-        </div>
-
-        {/* Main content — document viewer gets all remaining space */}
-        <div style={{flex: "1 1 auto", display: "flex", flexDirection: "column", height: "100%", minHeight: 0}}>
-          {/* Toggle button for tree panel */}
-          <div style={{flexShrink: 0, padding: "8px 12px", borderBottom: "1px solid #1f2937", display: "flex", alignItems: "center", gap: "8px"}}>
-            <Button variant="outline" size="sm" onClick={() => setShowTree(!showTree)} style={{border: "1px solid #374151", padding: "2px 10px", fontSize: "13px"}}>
-              <i className="fas fa-bars" style={{fontSize: "12px"}}></i>
-            </Button>
-          </div>
-          <div style={{flex: "1 1 auto", minHeight: 0, overflow: "auto"}}>
-            {selected && selected.isLeaf && <File file={selected} onSelect={onSelect} />}
-            {selected && !selected.isLeaf && <Folder selection={selected} onSelect={onSelect} onUpdate={onUpdate} counter={counter} />}
-          </div>
-        </div>
+        )}
+      </div>
     </Container>
   );
 }
