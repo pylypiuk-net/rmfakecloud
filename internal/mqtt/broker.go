@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/ddvk/rmfakecloud/internal/screenshare"
@@ -201,6 +202,23 @@ func (b *Broker) Start() error {
 	} else {
 		log.Infof("MQTT TCP listener (plain) on port %s", b.port)
 	}
+
+	// Add WebSocket listener on port+1 for MQTT-over-WebSocket clients (reMarkable tablet uses WSS)
+	wsPort := b.port
+	if p, err := strconv.Atoi(b.port); err == nil {
+		wsPort = fmt.Sprintf("%d", p+1)
+	}
+	wsListener := listeners.NewWebsocket(listeners.Config{
+		ID:        "ws",
+		Address:   ":" + wsPort,
+		TLSConfig: tlsConfig,
+	})
+
+	if err := b.server.AddListener(wsListener); err != nil {
+		return fmt.Errorf("failed to add WebSocket listener: %w", err)
+	}
+
+	log.Infof("MQTT WebSocket listener on port %s", wsPort)
 
 	go func() {
 		if err := b.server.Serve(); err != nil {
