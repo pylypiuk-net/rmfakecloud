@@ -82,22 +82,15 @@ func (app *App) Start() {
 		}
 	}
 
+	// HTTP server always runs plain — TLS termination is handled by Istio gateway
 	app.srv = &http.Server{
-		Addr:      ":" + app.cfg.Port,
-		Handler:   app.router,
-		TLSConfig: tlsConfig,
+		Addr:    ":" + app.cfg.Port,
+		Handler: app.router,
 	}
 
-	if tlsConfig != nil {
-		log.Info("Starting HTTPS server")
-		if err := app.srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %s\n", err)
-		}
-	} else {
-		log.Info("Starting HTTP server (plain)")
-		if err := app.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %s\n", err)
-		}
+	log.Info("Starting HTTP server (plain)")
+	if err := app.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("listen: %s\n", err)
 	}
 }
 
