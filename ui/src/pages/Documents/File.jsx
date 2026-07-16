@@ -87,11 +87,11 @@ export default function FileViewer({ file, onSelect }) {
 
   return (
     <>
-      <Navbar style={{ marginLeft: '-12px' }}>
+      <Navbar style={{ marginLeft: '-12px', flexShrink: 0 }}>
         { file && (<div><NameTag node={file} onSelect={onSelect} /></div>) }
       </Navbar>
 
-      <Navbar>
+      <Navbar style={{flexShrink: 0}}>
         {pages > 1 && (
           <div>
             <ButtonGroup aria-label="Basic example">
