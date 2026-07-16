@@ -82,7 +82,7 @@ const Home = () => {
   ];
 
   return (
-    <div>
+    <div style={{padding: "24px"}}>
       <div style={{marginBottom: "24px"}}>
         <h2 style={{color: "#e5e7eb", fontSize: "20px", fontWeight: 600, margin: 0}}>
           Dashboard

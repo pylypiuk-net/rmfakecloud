@@ -119,13 +119,13 @@ export default function FileViewer({ file, onSelect }) {
 
 
       {file && (
-        <div ref={parent} style={{height: "95%", width: "100%", display: "flex", justifyContent: "center", overflow: "auto"}}>
+        <div ref={parent} style={{flex: "1 1 auto", width: "100%", minHeight: 0, display: "flex", justifyContent: "center", overflow: "auto"}}>
 		  <Document file={downloadUrl} onLoadSuccess={onLoadSuccess} options={options}>
             <Page pageNumber={page} 
-							width={ width } 
-							renderAnnotationLayer={false} 
-							renderTextLayer={false}
-						/>
+						width={ width } 
+						renderAnnotationLayer={false} 
+						renderTextLayer={false}
+					/>
           </Document>
         </div>
       )}
