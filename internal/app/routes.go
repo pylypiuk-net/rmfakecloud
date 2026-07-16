@@ -82,7 +82,18 @@ func (app *App) registerRoutes(router *gin.Engine) {
 	router.POST("/report/v1", app.nullReport)
 	router.POST("/v2/events", app.nullReport)
 
+	// Log all WebSocket upgrade attempts regardless of path
+	router.Use(func(c *gin.Context) {
+		if c.GetHeader("Upgrade") != "" || c.GetHeader("Connection") == "Upgrade" {
+			log.Infof("[WS-DEBUG] Upgrade request: path=%s host=%s proto=%s upgrade=%s remote=%s",
+				c.Request.URL.Path, c.Request.Host, c.GetHeader("Sec-WebSocket-Protocol"),
+				c.GetHeader("Upgrade"), c.RemoteIP())
+		}
+		c.Next()
+	})
+
 	if app.mqttBroker != nil {
+		// Handle /mqtt and any path with WebSocket upgrade for MQTT
 		router.GET("/mqtt", app.handleMQTTWebSocket)
 	}
 

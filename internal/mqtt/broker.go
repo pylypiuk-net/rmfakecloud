@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -234,6 +235,30 @@ func (b *Broker) Stop() error {
 		return b.server.Close()
 	}
 	return nil
+}
+
+// HandleWebSocket upgrades an HTTP request to a WebSocket and bridges it to the MQTT broker.
+// This allows MQTT-over-WebSocket through the main HTTP server (port 3000) without needing
+// a separate listener port. The reMarkable tablet connects via WSS through the rmfakecloud-proxy.
+func (b *Broker) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		Subprotocols: []string{"mqtt"},
+		CheckOrigin:  func(r *http.Request) bool { return true },
+	}
+
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Warnf("MQTT WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer wsConn.Close()
+
+	ws := NewWsConn(wsConn)
+	log.Infof("MQTT WebSocket connection from %s", r.RemoteAddr)
+
+	if err := b.server.EstablishConnection("ws-http", ws); err != nil {
+		log.Warnf("MQTT WebSocket establish failed: %v", err)
+	}
 }
 
 func (b *Broker) PublishSignaling(userID, clientID string, payload []byte) {
