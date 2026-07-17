@@ -61,13 +61,15 @@ export default function VNCViewer() {
       const offset = i * 2;
       if (offset + 1 >= view.byteLength) break;
       // reMarkable uses little-endian RGB565 (despite what ServerInit says)
+      // reMarkable e-ink framebuffer is inverted: 0x0000 = white, 0xFFFF = black
       const pixel = view.getUint16(offset, true); // little-endian
       const r = (pixel >> 11) & 0x1f;
       const g = (pixel >> 5) & 0x3f;
       const b = pixel & 0x1f;
-      imgData.data[i * 4] = (r << 3) | (r >> 2);
-      imgData.data[i * 4 + 1] = (g << 2) | (g >> 4);
-      imgData.data[i * 4 + 2] = (b << 3) | (b >> 2);
+      // Invert: e-ink sends 0=white, we need 255-white → invert
+      imgData.data[i * 4] = 255 - ((r << 3) | (r >> 2));
+      imgData.data[i * 4 + 1] = 255 - ((g << 2) | (g >> 4));
+      imgData.data[i * 4 + 2] = 255 - ((b << 3) | (b >> 2));
       imgData.data[i * 4 + 3] = 255;
     }
 
