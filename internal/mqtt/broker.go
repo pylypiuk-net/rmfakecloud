@@ -306,8 +306,10 @@ func (ws *WsConn) Read(p []byte) (int, error) {
 	if ws.r == nil {
 		op, r, err := ws.C.NextReader()
 		if err != nil {
+			log.Infof("[WSCONN-DEBUG] NextReader error: %v op=%v", err, op)
 			return 0, err
 		}
+		log.Infof("[WSCONN-DEBUG] message received op=%d (BinaryMessage=%d, TextMessage=%d)", op, websocket.BinaryMessage, websocket.TextMessage)
 		if op != websocket.BinaryMessage {
 			return 0, ErrInvalidMessage
 		}
