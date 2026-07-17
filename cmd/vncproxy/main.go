@@ -262,12 +262,9 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort string) {
 
 	// Send SetEncodings: message-type=2, padding=0, count=6, encodings
 	encodings := []int32{
-		HEXTILE_ENCODING,
-		CORRE_ENCODING,
-		PSEUDO_CURSOR,
-		RRE_ENCODING,
-		ZRLE_ENCODING,
 		RAW_ENCODING,
+		PSEUDO_DESKTOPSIZE,
+		PSEUDO_CURSOR,
 	}
 	setEnc := make([]byte, 4+len(encodings)*4)
 	setEnc[0] = 2 // SetEncodings
