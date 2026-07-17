@@ -1,47 +1,46 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import lz4 from 'lz4js';
 
 const ROOT_URL = '/ui/api';
 
 // Framebuffer viewer for reMarkable screen sharing.
 // The proxy (fbproxy) runs `restream` on the tablet which captures xochitl's
-// framebuffer from process memory (ptrace) and sends LZ4-compressed RGB565
-// frames over WebSocket.
+// framebuffer from process memory (ptrace) and sends raw RGB565 frames
+// over WebSocket via the VNCHub.
 //
 // Protocol:
-//   1. First WS message is text: {"type":"meta","width":1404,"height":1872,"bpp":2,...}
-//   2. Subsequent WS messages are binary: LZ4 frame chunks
-//   3. Viewer accumulates chunks, decompresses complete LZ4 frames,
-//      and renders RGB565 pixels on a canvas with e-ink color inversion.
+//   - All messages are binary (VNCHub only forwards binary)
+//   - Messages are chunks of raw RGB565 pixel data
+//   - Accumulate until we have a full frame (1404×1872×2 = 5,253,576 bytes)
+//   - Render with e-ink color inversion (0x0000=white, 0xFFFF=black)
 export default function VNCViewer() {
   const canvasRef = useRef(null);
   const wsRef = useRef(null);
+  const frameBufRef = useRef(null);
   const [status, setStatus] = useState('disconnected');
   const [error, setError] = useState(null);
   const [stats, setStats] = useState({ frames: 0, bytes: 0 });
-  const metaRef = useRef(null);
-  const compressedBufRef = useRef(null);
 
-  // Render a raw RGB565 frame to the canvas with e-ink color inversion
-  const renderFrame = useCallback((pixelData, width, height) => {
+  const WIDTH = 1404;
+  const HEIGHT = 1872;
+  const BPP = 2;
+  const FRAME_SIZE = WIDTH * HEIGHT * BPP;
+
+  // Render RGB565 data to canvas
+  const renderFrame = useCallback((pixelData) => {
     const container = canvasRef.current;
     if (!container) return;
     const canvas = container.querySelector('canvas');
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
 
-    if (canvas.width !== width) canvas.width = width;
-    if (canvas.height !== height) canvas.height = height;
-
-    const numPixels = width * height;
-    const imgData = ctx.createImageData(width, height);
+    const numPixels = WIDTH * HEIGHT;
+    const imgData = ctx.createImageData(WIDTH, HEIGHT);
     const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
 
     for (let i = 0; i < numPixels; i++) {
       const offset = i * 2;
       if (offset + 1 >= view.byteLength) break;
-      // Little-endian RGB565
-      const pixel = view.getUint16(offset, true);
+      const pixel = view.getUint16(offset, true); // little-endian
       const r = (pixel >> 11) & 0x1f;
       const g = (pixel >> 5) & 0x3f;
       const b = pixel & 0x1f;
@@ -64,8 +63,7 @@ export default function VNCViewer() {
     setStatus('connecting');
     setError(null);
     setStats({ frames: 0, bytes: 0 });
-    metaRef.current = null;
-    compressedBufRef.current = new Uint8Array(0);
+    frameBufRef.current = new Uint8Array(0);
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}${ROOT_URL}/screenshare/vnc/stream`;
@@ -81,8 +79,8 @@ export default function VNCViewer() {
     if (container) {
       container.innerHTML = '';
       const canvas = document.createElement('canvas');
-      canvas.width = 1404;
-      canvas.height = 1872;
+      canvas.width = WIDTH;
+      canvas.height = HEIGHT;
       canvas.style.maxWidth = '100%';
       canvas.style.maxHeight = '100%';
       canvas.style.imageRendering = 'pixelated';
@@ -96,97 +94,29 @@ export default function VNCViewer() {
     };
 
     ws.onmessage = (e) => {
-      if (typeof e.data === 'string') {
-        // Metadata message
-        try {
-          const meta = JSON.parse(e.data);
-          if (meta.type === 'meta') {
-            metaRef.current = meta;
-            console.log('[FB] Metadata:', meta);
-            const container = canvasRef.current;
-            if (container) {
-              const canvas = container.querySelector('canvas');
-              if (canvas) {
-                canvas.width = meta.width;
-                canvas.height = meta.height;
-              }
-            }
-          }
-        } catch (err) {
-          console.error('[FB] Parse metadata:', err);
-        }
-        return;
-      }
-
       if (e.data instanceof ArrayBuffer) {
         const newData = new Uint8Array(e.data);
 
-        // Append to compressed buffer
-        const old = compressedBufRef.current;
+        // Append to frame buffer
+        const old = frameBufRef.current;
         const combined = new Uint8Array(old.length + newData.length);
         combined.set(old);
         combined.set(newData, old.length);
-        compressedBufRef.current = combined;
+        frameBufRef.current = combined;
 
-        const meta = metaRef.current || { width: 1404, height: 1872, bpp: 2 };
-        const frameSize = meta.width * meta.height * meta.bpp;
+        // Check if we have enough data for a complete frame
+        while (frameBufRef.current.length >= FRAME_SIZE) {
+          // Extract one frame
+          const frameData = frameBufRef.current.slice(0, FRAME_SIZE);
+          renderFrame(frameData);
 
-        // Try to decompress LZ4 frames from the buffer
-        // restream sends a continuous stream of LZ4 frames
-        // Each LZ4 frame starts with magic 0x04224D18
-        let buf = compressedBufRef.current;
+          setStats(prev => ({
+            frames: prev.frames + 1,
+            bytes: prev.bytes + FRAME_SIZE,
+          }));
 
-        while (buf.length > 8) {
-          // Find LZ4 frame magic number
-          const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-          const magic = view.getUint32(0, true);
-
-          if (magic !== 0x184D2204) {
-            // Not a valid LZ4 frame — skip 1 byte and try again
-            buf = buf.slice(1);
-            continue;
-          }
-
-          // Try to decompress
-          try {
-            const decompressed = lz4.decompress(buf);
-            if (decompressed && decompressed.length >= frameSize) {
-              // We have at least one complete frame
-              const frameData = decompressed.slice(0, frameSize);
-              renderFrame(frameData, meta.width, meta.height);
-
-              setStats(prev => ({
-                frames: prev.frames + 1,
-                bytes: prev.bytes + frameSize,
-              }));
-
-              // Keep the rest for next frame
-              const remaining = decompressed.slice(frameSize);
-              if (remaining.length > 0) {
-                // We have leftover decompressed data — but it's decompressed, not compressed
-                // This means multiple frames were in one LZ4 stream
-                // For now, just discard and wait for the next compressed frame
-              }
-
-              // Consume the entire buffer (restream sends one frame at a time)
-              compressedBufRef.current = new Uint8Array(0);
-              break;
-            } else if (decompressed && decompressed.length > 0) {
-              // Partial frame — wait for more data
-              break;
-            } else {
-              // Decompression failed — skip 1 byte
-              buf = buf.slice(1);
-              continue;
-            }
-          } catch (err) {
-            // Incomplete frame — wait for more data
-            break;
-          }
-        }
-
-        if (buf !== compressedBufRef.current) {
-          compressedBufRef.current = buf;
+          // Keep remaining data
+          frameBufRef.current = frameBufRef.current.slice(FRAME_SIZE);
         }
       }
     };
