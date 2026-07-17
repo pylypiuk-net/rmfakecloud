@@ -9,7 +9,7 @@ WORKDIR /src
 #RUN pnpm fetch 
 
 COPY ui .
-RUN pnpm install && pnpm build
+RUN pnpm install --ignore-scripts && pnpm build
 
 FROM golang:bookworm AS gobuilder
 ARG VERSION
