@@ -1,11 +1,11 @@
 ARG VERSION=0.0.0
 FROM --platform=$BUILDPLATFORM node:lts AS uibuilder
+RUN rm -rf /var/lib/dpkg/tmp.ci
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable pnpm && corepack install -g pnpm@latest-9
 
 WORKDIR /src
-RUN rm -rf /var/lib/dpkg/tmp.ci
 #COPY ui/package.json ui/pnpm-lock.yaml /src
 #RUN pnpm fetch 
 
