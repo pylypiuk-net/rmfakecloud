@@ -3,18 +3,13 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 const ROOT_URL = '/ui/api';
 
 // Framebuffer viewer for reMarkable screen sharing.
-// The proxy (fbproxy) runs `restream` on the tablet which captures xochitl's
-// framebuffer from process memory and sends it as an LZ4-compressed stream
-// over WebSocket.
+// The proxy (fbproxy) reads xochitl's framebuffer from process memory,
+// converts BGRA→grayscale, rotates to portrait, and sends raw 8-bit
+// grayscale frames (1404×1872) over WebSocket.
 //
 // Protocol:
-//   1. First WS message is text: {"type":"meta","width":1404,"height":1872,"bpp":2,"format":"rgb565le","compressed":"lz4"}
-//   2. Subsequent WS messages are binary: chunks of the LZ4 frame stream
-//   3. The viewer accumulates chunks, decompresses complete LZ4 frames,
-//      and renders the raw RGB565 pixels on a canvas.
-//
-// LZ4 frame format: https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
-// We implement a minimal decoder for the specific format restream produces.
+//   1. First WS message is text: {"type":"meta","width":1404,"height":1872,"bpp":1,"format":"gray8"}
+//   2. Subsequent WS messages are binary: raw grayscale frames (1404×1872 = 2,629,488 bytes)
 export default function VNCViewer() {
   const canvasRef = useRef(null);
   const wsRef = useRef(null);
@@ -22,177 +17,6 @@ export default function VNCViewer() {
   const [error, setError] = useState(null);
   const [stats, setStats] = useState({ frames: 0, bytes: 0 });
   const metaRef = useRef(null);
-  const compressedBufRef = useRef(null);
-  const frameBufRef = useRef(null); // decompressed frame buffer
-
-  // LZ4 block decompression (raw block, not frame)
-  // LZ4 block format: sequences of tokens
-  // Token: 4 bits literal length + 4 bits match length
-  const lz4Block = useCallback((input, outputSize) => {
-    const output = new Uint8Array(outputSize);
-    let ip = 0;
-    let op = 0;
-    const inputLen = input.length;
-
-    while (ip < inputLen) {
-      const token = input[ip++];
-      let literalLen = token >> 4;
-      let matchLen = token & 0x0f;
-
-      // Extended literal length
-      if (literalLen === 15) {
-        while (ip < inputLen) {
-          const b = input[ip++];
-          literalLen += b;
-          if (b !== 255) break;
-        }
-      }
-
-      // Copy literals
-      for (let i = 0; i < literalLen; i++) {
-        if (ip >= inputLen || op >= outputSize) break;
-        output[op++] = input[ip++];
-      }
-
-      if (ip >= inputLen) break;
-
-      // Match offset (2 bytes, little-endian)
-      if (ip + 1 >= inputLen) break;
-      const offset = input[ip] | (input[ip + 1] << 8);
-      ip += 2;
-
-      // Extended match length
-      if (matchLen === 15) {
-        while (ip < inputLen) {
-          const b = input[ip++];
-          matchLen += b;
-          if (b !== 255) break;
-        }
-      }
-      matchLen += 4; // minimum match is 4
-
-      // Copy match (with overlap for RLE)
-      const matchStart = op - offset;
-      if (matchStart < 0) break;
-      for (let i = 0; i < matchLen; i++) {
-        if (op >= outputSize) break;
-        output[op] = output[matchStart + i];
-        op++;
-      }
-    }
-
-    return output.slice(0, op);
-  }, []);
-
-  // Decompress LZ4 frame stream
-  // LZ4 frame: magic(4) + FLG(1) + BD(1) + [HC(4)] + blocks...
-  // Each block: block_size(4) + block_data(block_size)
-  // End mark: block_size = 0
-  const decompressLZ4Frame = useCallback((compressed) => {
-    const view = new DataView(compressed.buffer, compressed.byteOffset, compressed.byteLength);
-    let offset = 0;
-
-    // Check magic
-    if (compressed.byteLength < 7) return null;
-    const magic = view.getUint32(0, true);
-    if (magic !== 0x184D2204) return null;
-    offset = 4;
-
-    // FLG byte
-    const flg = compressed[offset++];
-    const bd = compressed[offset++];
-    const contentSizeFlag = (flg >> 5) & 1;
-    const checksumFlag = (flg >> 4) & 1;
-    const dictIDFlag = flg & 1;
-
-    // Skip content size (8 bytes) if present
-    if (contentSizeFlag) offset += 8;
-    // Skip dictionary ID (4 bytes) if present
-    if (dictIDFlag) offset += 4;
-    // Skip header checksum (4 bytes) if present
-    if (checksumFlag) offset += 4;
-
-    // Read blocks
-    const blocks = [];
-    while (offset + 4 <= compressed.byteLength) {
-      const blockSize = view.getUint32(offset, true);
-      offset += 4;
-
-      if (blockSize === 0) break; // end mark
-
-      const uncompressed = !(blockSize & 0x80000000);
-      const actualSize = blockSize & 0x7FFFFFFF;
-
-      if (offset + actualSize > compressed.byteLength) {
-        // Incomplete block — need more data
-        return null;
-      }
-
-      const blockData = compressed.slice(offset, offset + actualSize);
-      offset += actualSize;
-
-      if (uncompressed) {
-        blocks.push(blockData);
-      } else {
-        // Compressed block — decompress
-        // Max decompressed block size is 4 * compressed size (LZ4 spec)
-        const maxDecompressed = Math.max(actualSize * 255, 65536);
-        const decompressed = lz4Block(blockData, maxDecompressed);
-        blocks.push(decompressed);
-      }
-    }
-
-    // Check if we have a complete frame (end mark found)
-    if (offset >= compressed.byteLength && compressed.byteLength > 7) {
-      // No end mark found yet — might be incomplete
-      // But restream might not send end marks between frames
-      // Let's just concatenate all blocks
-    }
-
-    // Concatenate blocks
-    let totalLen = 0;
-    for (const b of blocks) totalLen += b.length;
-    const result = new Uint8Array(totalLen);
-    let pos = 0;
-    for (const b of blocks) {
-      result.set(b, pos);
-      pos += b.length;
-    }
-
-    return { data: result, consumed: offset };
-  }, [lz4Block]);
-
-  // Render a raw RGB565 frame to the canvas
-  const renderFrame = useCallback((pixelData, width, height) => {
-    const container = canvasRef.current;
-    if (!container) return;
-    const canvas = container.querySelector('canvas');
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-
-    if (canvas.width !== width) canvas.width = width;
-    if (canvas.height !== height) canvas.height = height;
-
-    const numPixels = width * height;
-    const imgData = ctx.createImageData(width, height);
-    const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
-
-    for (let i = 0; i < numPixels; i++) {
-      const offset = i * 2;
-      if (offset + 1 >= view.byteLength) break;
-      const pixel = view.getUint16(offset, true); // little-endian RGB565
-      const r = (pixel >> 11) & 0x1f;
-      const g = (pixel >> 5) & 0x3f;
-      const b = pixel & 0x1f;
-      // e-ink: 0x0000 = white, 0xFFFF = black → invert
-      imgData.data[i * 4] = 255 - ((r << 3) | (r >> 2));
-      imgData.data[i * 4 + 1] = 255 - ((g << 2) | (g >> 4));
-      imgData.data[i * 4 + 2] = 255 - ((b << 3) | (b >> 2));
-      imgData.data[i * 4 + 3] = 255;
-    }
-
-    ctx.putImageData(imgData, 0, 0);
-  }, []);
 
   const connectVNC = useCallback(() => {
     if (wsRef.current) {
@@ -204,7 +28,6 @@ export default function VNCViewer() {
     setError(null);
     setStats({ frames: 0, bytes: 0 });
     metaRef.current = null;
-    compressedBufRef.current = new Uint8Array(0);
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}${ROOT_URL}/screenshare/vnc/stream`;
@@ -258,56 +81,38 @@ export default function VNCViewer() {
       }
 
       if (e.data instanceof ArrayBuffer) {
-        const newData = new Uint8Array(e.data);
+        const meta = metaRef.current || { width: 1404, height: 1872, bpp: 1 };
+        const frameData = new Uint8Array(e.data);
+        const expectedSize = meta.width * meta.height * meta.bpp;
 
-        // Append to compressed buffer
-        const old = compressedBufRef.current;
-        const combined = new Uint8Array(old.length + newData.length);
-        combined.set(old);
-        combined.set(newData, old.length);
-        compressedBufRef.current = combined;
-
-        const meta = metaRef.current || { width: 1404, height: 1872, bpp: 2 };
-        const frameSize = meta.width * meta.height * meta.bpp;
-
-        // Try to decompress frames from the buffer
-        while (compressedBufRef.current.length > 8) {
-          const result = decompressLZ4Frame(compressedBufRef.current);
-          if (!result || result.data.length === 0) break;
-
-          const decompressed = result.data;
-
-          // Check if we have enough data for a complete frame
-          if (decompressed.length >= frameSize) {
-            // Extract one frame
-            const frameData = decompressed.slice(0, frameSize);
-            renderFrame(frameData, meta.width, meta.height);
-
-            setStats(prev => ({
-              frames: prev.frames + 1,
-              bytes: prev.bytes + frameSize,
-            }));
-
-            // Keep remaining decompressed data for next frame
-            const remaining = decompressed.slice(frameSize);
-            // Put remaining back — but this is decompressed, not compressed
-            // We need a different approach: keep track of consumed compressed bytes
-            if (result.consumed > 0) {
-              compressedBufRef.current = compressedBufRef.current.slice(result.consumed);
-              // Prepend remaining decompressed data... but this doesn't work
-              // because the remaining is decompressed, not compressed.
-              // Actually, if the frame boundary aligns with the LZ4 frame boundary,
-              // this should work.
-            } else {
-              // Can't determine consumed bytes — consume entire buffer
-              compressedBufRef.current = new Uint8Array(0);
-              break;
-            }
-          } else {
-            // Not enough data for a complete frame yet
-            break;
-          }
+        if (frameData.length < expectedSize) {
+          console.warn(`[FB] Incomplete frame: ${frameData.length} / ${expectedSize}`);
+          return;
         }
+
+        // Render grayscale frame to canvas
+        const container = canvasRef.current;
+        if (!container) return;
+        const canvas = container.querySelector('canvas');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+
+        const imgData = ctx.createImageData(meta.width, meta.height);
+        // E-ink: 0=black, 255=white (no inversion needed for direct memory read)
+        // The fbproxy reads the R channel from BGRA, which is already grayscale
+        for (let i = 0; i < meta.width * meta.height; i++) {
+          const gray = frameData[i];
+          imgData.data[i * 4] = gray;
+          imgData.data[i * 4 + 1] = gray;
+          imgData.data[i * 4 + 2] = gray;
+          imgData.data[i * 4 + 3] = 255;
+        }
+        ctx.putImageData(imgData, 0, 0);
+
+        setStats(prev => ({
+          frames: prev.frames + 1,
+          bytes: prev.bytes + frameData.length,
+        }));
       }
     };
 
@@ -324,7 +129,7 @@ export default function VNCViewer() {
       }
       wsRef.current = null;
     };
-  }, [decompressLZ4Frame, renderFrame]);
+  }, []);
 
   const disconnectVNC = useCallback(() => {
     if (wsRef.current) {
