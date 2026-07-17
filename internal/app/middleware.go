@@ -22,6 +22,11 @@ const (
 
 func (app *App) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Debug: log headers for WebSocket upgrade requests
+		if c.GetHeader("Upgrade") != "" || c.GetHeader("Connection") == "Upgrade" {
+			log.Infof("[AUTH-WS-DEBUG] WS upgrade auth attempt: path=%s host=%s headers=%v remote=%s query=%s",
+				c.Request.URL.Path, c.Request.Host, c.Request.Header, c.RemoteIP(), c.Request.URL.RawQuery)
+		}
 		claims, err := app.getUserClaims(c)
 
 		if err != nil {

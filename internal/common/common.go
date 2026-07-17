@@ -21,16 +21,20 @@ var signingMethod = jwt.SigningMethodHS256
 func GetToken(c *gin.Context) (string, error) {
 	auth := c.Request.Header["Authorization"]
 
-	if len(auth) < 1 {
-		return "", errors.New("missing auth header")
+	if len(auth) >= 1 {
+		token := strings.Split(auth[0], " ")
+		if len(token) >= 2 {
+			return token[1], nil
+		}
 	}
-	token := strings.Split(auth[0], " ")
-	if len(token) < 2 {
-		return "", errors.New("wrong token format")
-	}
-	strToken := token[1]
-	return strToken, nil
 
+	// Fallback: check query parameter "token" (used by Qt WebSocket clients
+	// that can't set custom headers on WebSocket upgrade requests)
+	if q := c.Query("token"); q != "" {
+		return q, nil
+	}
+
+	return "", errors.New("missing auth header")
 }
 
 // ClaimsFromToken parses the claims from the token
