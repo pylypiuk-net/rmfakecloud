@@ -107,6 +107,11 @@ func (app *ReactAppWrapper) RegisterRoutes(router *gin.Engine) {
 	ss.POST("room/:roomId/answer", app.screenshareSendAnswer)
 	ss.DELETE("room/:roomId", app.screenshareDeleteRoom)
 
+	// VNC stream: tablet proxy connects here to push RFB data,
+	// web UI connects here to receive it.
+	ss.GET("vnc/stream", app.vncStreamHandler)
+	ss.POST("vnc/connect", app.vncConnectHandler)
+
 	//admin
 	admin := auth.Group("")
 	admin.Use(app.adminMiddleware())
