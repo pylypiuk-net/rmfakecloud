@@ -44,6 +44,11 @@ func main() {
 		log.Fatal("USER_ID required (first arg or env)")
 	}
 
+	deviceToken := os.Getenv("DEVICE_TOKEN")
+	if deviceToken == "" && len(os.Args) > 2 {
+		deviceToken = os.Args[2]
+	}
+
 	serverHost := os.Getenv("SERVER_HOST")
 	if serverHost == "" {
 		serverHost = "172.21.1.1"
@@ -138,7 +143,7 @@ func main() {
 		mu.Unlock()
 
 		// Send SetEncodings + FramebufferUpdateRequest, then pipe to server
-		go pipeRFBStream(tlsConn, serverHost, serverPort)
+		go pipeRFBStream(tlsConn, serverHost, serverPort, deviceToken)
 	}
 }
 
@@ -257,7 +262,7 @@ func rfbHandshake(conn *tls.Conn, challenge []byte) error {
 	return nil
 }
 
-func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort string) {
+func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string) {
 	defer rfbConn.Close()
 
 	// Send SetEncodings: message-type=2, padding=0, count=6, encodings
@@ -294,7 +299,7 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort string) {
 	log.Printf("Sent FramebufferUpdateRequest")
 
 	// Connect to rmfakecloud via WebSocket
-	wsURL := fmt.Sprintf("ws://%s:%s/ui/api/screenshare/vnc/connect", serverHost, serverPort)
+	wsURL := fmt.Sprintf("ws://%s:%s/ui/api/screenshare/vnc/connect?token=%s", serverHost, serverPort, deviceToken)
 	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		log.Printf("WS connect to %s: %v", wsURL, err)
