@@ -112,7 +112,7 @@ func (app *ReactAppWrapper) RegisterRoutes(router *gin.Engine) {
 	// The proxy endpoint uses device token auth (screenshare scope),
 	// the viewer endpoint uses web JWT auth.
 	r.GET("screenshare/vnc/stream", app.authMiddleware(), app.vncStreamHandler)
-	r.POST("screenshare/vnc/connect", app.vncProxyConnectHandler)
+	r.GET("screenshare/vnc/connect", app.vncProxyConnectHandler)
 
 	//admin
 	admin := auth.Group("")
