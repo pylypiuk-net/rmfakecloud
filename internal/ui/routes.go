@@ -109,8 +109,10 @@ func (app *ReactAppWrapper) RegisterRoutes(router *gin.Engine) {
 
 	// VNC stream: tablet proxy connects here to push RFB data,
 	// web UI connects here to receive it.
-	ss.GET("vnc/stream", app.vncStreamHandler)
-	ss.POST("vnc/connect", app.vncConnectHandler)
+	// The proxy endpoint uses device token auth (screenshare scope),
+	// the viewer endpoint uses web JWT auth.
+	r.GET("screenshare/vnc/stream", app.authMiddleware(), app.vncStreamHandler)
+	r.POST("screenshare/vnc/connect", app.vncProxyConnectHandler)
 
 	//admin
 	admin := auth.Group("")

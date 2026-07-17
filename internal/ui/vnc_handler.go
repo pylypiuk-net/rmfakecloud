@@ -2,12 +2,23 @@ package ui
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 
+	"github.com/ddvk/rmfakecloud/internal/common"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
 )
+
+// deviceTokenClaims matches the JWT structure used by the tablet's UserToken.
+type deviceTokenClaims struct {
+	UserID   string `json:"auth0-userid"`
+	DeviceID string `json:"device-id"`
+	Scopes   string `json:"scopes,omitempty"`
+	jwt.StandardClaims
+}
 
 var upgraderVNC = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -16,8 +27,6 @@ var upgraderVNC = websocket.Upgrader{
 }
 
 // vnHub bridges the tablet VNC proxy to web UI viewers.
-// The proxy connects via POST /vnc/connect (raw TCP stream),
-// and web UI clients connect via GET /vnc/stream (WebSocket).
 var vnHub = &VNCHub{
 	broadcast: make(chan []byte, 256),
 	register:  make(chan *websocket.Conn, 1),
@@ -25,7 +34,6 @@ var vnHub = &VNCHub{
 
 type VNCHub struct {
 	mu        sync.Mutex
-	proxyConn *websocket.Conn // the tablet proxy connection
 	clients   map[*websocket.Conn]bool
 	broadcast chan []byte
 	register  chan *websocket.Conn
@@ -79,26 +87,55 @@ func (app *ReactAppWrapper) vncStreamHandler(c *gin.Context) {
 	log.Info("VNC: web UI client disconnected")
 }
 
-// vncConnectHandler: tablet proxy connects here to push RFB data
-// The proxy sends RFB frames as binary WebSocket messages.
-func (app *ReactAppWrapper) vncConnectHandler(c *gin.Context) {
+// vncProxyConnectHandler: tablet proxy connects here to push RFB data.
+// Uses device token auth (screenshare scope) instead of web JWT.
+func (app *ReactAppWrapper) vncProxyConnectHandler(c *gin.Context) {
+	// Auth: device token via query param or Authorization header
+	token, err := common.GetToken(c)
+	if err != nil {
+		log.Warn("[vnc-proxy] no token: ", err)
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
+	// Validate token — device tokens use the same JWT secret
+	claims := &deviceTokenClaims{}
+	err = common.ClaimsFromToken(claims, token, app.cfg.JWTSecretKey)
+	if err != nil {
+		log.Warn("[vnc-proxy] token invalid: ", err)
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
+	// Check screenshare scope
+	scopes := strings.Fields(claims.Scopes)
+	hasScreenShare := false
+	for _, s := range scopes {
+		if s == "screenshare" {
+			hasScreenShare = true
+			break
+		}
+	}
+	if !hasScreenShare {
+		log.Warn("[vnc-proxy] no screenshare scope, scopes: ", claims.Scopes)
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+
+	log.Infof("[vnc-proxy] tablet proxy connected, user: %s, device: %s", claims.UserID, claims.DeviceID)
+
 	ws, err := upgraderVNC.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Printf("VNC connect upgrade: %v", err)
+		log.Printf("[vnc-proxy] upgrade: %v", err)
 		return
 	}
 	defer ws.Close()
-
-	log.Info("VNC: tablet proxy connected")
-	vnHub.mu.Lock()
-	vnHub.proxyConn = ws
-	vnHub.mu.Unlock()
 
 	// Read RFB data from proxy and broadcast to web UI clients
 	for {
 		msgType, data, err := ws.ReadMessage()
 		if err != nil {
-			log.Printf("VNC: proxy read error: %v", err)
+			log.Printf("[vnc-proxy] read error: %v", err)
 			break
 		}
 		if msgType == websocket.BinaryMessage {
@@ -110,8 +147,5 @@ func (app *ReactAppWrapper) vncConnectHandler(c *gin.Context) {
 		}
 	}
 
-	vnHub.mu.Lock()
-	vnHub.proxyConn = nil
-	vnHub.mu.Unlock()
-	log.Info("VNC: tablet proxy disconnected")
+	log.Info("[vnc-proxy] tablet proxy disconnected")
 }
