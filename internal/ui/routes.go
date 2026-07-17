@@ -22,6 +22,15 @@ func (app *ReactAppWrapper) RegisterRoutes(router *gin.Engine) {
 	//hack for index.html
 	router.NoRoute(func(c *gin.Context) {
 		uri := c.Request.RequestURI
+		// Log all requests with Upgrade header for debugging tablet MQTT
+		if c.GetHeader("Upgrade") != "" || c.GetHeader("Connection") == "Upgrade" {
+			log.Infof("[WS-DEBUG-NOROUTE] Upgrade request on unmatched path: %s host=%s upgrade=%s proto=%s remote=%s",
+				uri, c.Request.Host, c.GetHeader("Upgrade"), c.GetHeader("Sec-WebSocket-Protocol"), c.RemoteIP())
+		}
+		// Log all non-GET / non-UI requests from proxy
+		if c.RemoteIP() == "127.0.0.1" || strings.HasPrefix(c.RemoteIP(), "169.254.") {
+			log.Infof("[PROXY-DEBUG] %s %s host=%s remote=%s", c.Request.Method, uri, c.Request.Host, c.RemoteIP())
+		}
 		log.Info(uri)
 		if strings.HasPrefix(uri, "/api") ||
 			strings.HasPrefix(uri, "/ui/api") ||
