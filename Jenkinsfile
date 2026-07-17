@@ -48,6 +48,7 @@ pipeline {
                                              --context `pwd` \
                                              --destination=${REGISTRY}/jenkins/rmfakecloud:v0.${BUILD_NUMBER} \
                                              --destination=${REGISTRY}/jenkins/rmfakecloud:latest \
+                                             --snapshot-mode=redo \
                                              --skip-tls-verify
                             '''
                         }
