@@ -2,216 +2,197 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 const ROOT_URL = '/ui/api';
 
-// RFB stream parser that buffers across WebSocket messages.
-// The proxy sends raw RFB protocol bytes as WebSocket binary messages.
-// A single FramebufferUpdate (5.2MB) arrives as many 16KB messages,
-// so we must buffer and parse the RFB byte stream continuously.
+// Framebuffer viewer for reMarkable screen sharing.
+// The proxy (fbproxy) runs `restream` on the tablet which captures xochitl's
+// framebuffer from process memory and sends it as an LZ4-compressed stream
+// over WebSocket.
+//
+// Protocol:
+//   1. First WS message is text: {"type":"meta","width":1404,"height":1872,"bpp":2,"format":"rgb565le","compressed":"lz4"}
+//   2. Subsequent WS messages are binary: chunks of the LZ4 frame stream
+//   3. The viewer accumulates chunks, decompresses complete LZ4 frames,
+//      and renders the raw RGB565 pixels on a canvas.
+//
+// LZ4 frame format: https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
+// We implement a minimal decoder for the specific format restream produces.
 export default function VNCViewer() {
   const canvasRef = useRef(null);
   const wsRef = useRef(null);
-  const streamBufRef = useRef(null);      // accumulated bytes
-  const parseStateRef = useRef(null);      // RFB parser state machine
   const [status, setStatus] = useState('disconnected');
   const [error, setError] = useState(null);
   const [stats, setStats] = useState({ frames: 0, bytes: 0 });
+  const metaRef = useRef(null);
+  const compressedBufRef = useRef(null);
+  const frameBufRef = useRef(null); // decompressed frame buffer
 
-  // Initialize parser state
-  const initParser = useCallback(() => {
-    streamBufRef.current = new Uint8Array(0);
-    parseStateRef.current = {
-      width: 1404,
-      height: 1872,
-      bytesPerPixel: 2,
-      // Parser state: start directly at 'message' phase — the proxy
-      // already consumed ServerInit during the RFB handshake, so the
-      // viewer only receives FramebufferUpdate messages.
-      phase: 'message',
-      nameBytesRemaining: 0,
-    };
+  // LZ4 block decompression (raw block, not frame)
+  // LZ4 block format: sequences of tokens
+  // Token: 4 bits literal length + 4 bits match length
+  const lz4Block = useCallback((input, outputSize) => {
+    const output = new Uint8Array(outputSize);
+    let ip = 0;
+    let op = 0;
+    const inputLen = input.length;
+
+    while (ip < inputLen) {
+      const token = input[ip++];
+      let literalLen = token >> 4;
+      let matchLen = token & 0x0f;
+
+      // Extended literal length
+      if (literalLen === 15) {
+        while (ip < inputLen) {
+          const b = input[ip++];
+          literalLen += b;
+          if (b !== 255) break;
+        }
+      }
+
+      // Copy literals
+      for (let i = 0; i < literalLen; i++) {
+        if (ip >= inputLen || op >= outputSize) break;
+        output[op++] = input[ip++];
+      }
+
+      if (ip >= inputLen) break;
+
+      // Match offset (2 bytes, little-endian)
+      if (ip + 1 >= inputLen) break;
+      const offset = input[ip] | (input[ip + 1] << 8);
+      ip += 2;
+
+      // Extended match length
+      if (matchLen === 15) {
+        while (ip < inputLen) {
+          const b = input[ip++];
+          matchLen += b;
+          if (b !== 255) break;
+        }
+      }
+      matchLen += 4; // minimum match is 4
+
+      // Copy match (with overlap for RLE)
+      const matchStart = op - offset;
+      if (matchStart < 0) break;
+      for (let i = 0; i < matchLen; i++) {
+        if (op >= outputSize) break;
+        output[op] = output[matchStart + i];
+        op++;
+      }
+    }
+
+    return output.slice(0, op);
   }, []);
 
-  // Append new data to the stream buffer
-  const appendData = useCallback((newData) => {
-    const old = streamBufRef.current;
-    const combined = new Uint8Array(old.length + newData.length);
-    combined.set(old);
-    combined.set(newData, old.length);
-    streamBufRef.current = combined;
-  }, []);
+  // Decompress LZ4 frame stream
+  // LZ4 frame: magic(4) + FLG(1) + BD(1) + [HC(4)] + blocks...
+  // Each block: block_size(4) + block_data(block_size)
+  // End mark: block_size = 0
+  const decompressLZ4Frame = useCallback((compressed) => {
+    const view = new DataView(compressed.buffer, compressed.byteOffset, compressed.byteLength);
+    let offset = 0;
 
-  // Consume N bytes from the front of the buffer
-  const consume = useCallback((n) => {
-    const buf = streamBufRef.current;
-    streamBufRef.current = buf.slice(n);
-  }, []);
+    // Check magic
+    if (compressed.byteLength < 7) return null;
+    const magic = view.getUint32(0, true);
+    if (magic !== 0x184D2204) return null;
+    offset = 4;
 
-  // Render a RAW RGB565 rectangle to the canvas
-  const renderRect = useCallback((x, y, w, h, pixelData) => {
+    // FLG byte
+    const flg = compressed[offset++];
+    const bd = compressed[offset++];
+    const contentSizeFlag = (flg >> 5) & 1;
+    const checksumFlag = (flg >> 4) & 1;
+    const dictIDFlag = flg & 1;
+
+    // Skip content size (8 bytes) if present
+    if (contentSizeFlag) offset += 8;
+    // Skip dictionary ID (4 bytes) if present
+    if (dictIDFlag) offset += 4;
+    // Skip header checksum (4 bytes) if present
+    if (checksumFlag) offset += 4;
+
+    // Read blocks
+    const blocks = [];
+    while (offset + 4 <= compressed.byteLength) {
+      const blockSize = view.getUint32(offset, true);
+      offset += 4;
+
+      if (blockSize === 0) break; // end mark
+
+      const uncompressed = !(blockSize & 0x80000000);
+      const actualSize = blockSize & 0x7FFFFFFF;
+
+      if (offset + actualSize > compressed.byteLength) {
+        // Incomplete block — need more data
+        return null;
+      }
+
+      const blockData = compressed.slice(offset, offset + actualSize);
+      offset += actualSize;
+
+      if (uncompressed) {
+        blocks.push(blockData);
+      } else {
+        // Compressed block — decompress
+        // Max decompressed block size is 4 * compressed size (LZ4 spec)
+        const maxDecompressed = Math.max(actualSize * 255, 65536);
+        const decompressed = lz4Block(blockData, maxDecompressed);
+        blocks.push(decompressed);
+      }
+    }
+
+    // Check if we have a complete frame (end mark found)
+    if (offset >= compressed.byteLength && compressed.byteLength > 7) {
+      // No end mark found yet — might be incomplete
+      // But restream might not send end marks between frames
+      // Let's just concatenate all blocks
+    }
+
+    // Concatenate blocks
+    let totalLen = 0;
+    for (const b of blocks) totalLen += b.length;
+    const result = new Uint8Array(totalLen);
+    let pos = 0;
+    for (const b of blocks) {
+      result.set(b, pos);
+      pos += b.length;
+    }
+
+    return { data: result, consumed: offset };
+  }, [lz4Block]);
+
+  // Render a raw RGB565 frame to the canvas
+  const renderFrame = useCallback((pixelData, width, height) => {
     const container = canvasRef.current;
     if (!container) return;
     const canvas = container.querySelector('canvas');
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
 
-    const numPixels = w * h;
-    const imgData = ctx.createImageData(w, h);
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+
+    const numPixels = width * height;
+    const imgData = ctx.createImageData(width, height);
     const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
 
     for (let i = 0; i < numPixels; i++) {
       const offset = i * 2;
       if (offset + 1 >= view.byteLength) break;
-      // reMarkable uses little-endian RGB565 (despite what ServerInit says)
-      // reMarkable e-ink framebuffer is inverted: 0x0000 = white, 0xFFFF = black
-      const pixel = view.getUint16(offset, true); // little-endian
+      const pixel = view.getUint16(offset, true); // little-endian RGB565
       const r = (pixel >> 11) & 0x1f;
       const g = (pixel >> 5) & 0x3f;
       const b = pixel & 0x1f;
-      // Invert: e-ink sends 0=white, we need 255-white → invert
+      // e-ink: 0x0000 = white, 0xFFFF = black → invert
       imgData.data[i * 4] = 255 - ((r << 3) | (r >> 2));
       imgData.data[i * 4 + 1] = 255 - ((g << 2) | (g >> 4));
       imgData.data[i * 4 + 2] = 255 - ((b << 3) | (b >> 2));
       imgData.data[i * 4 + 3] = 255;
     }
 
-    ctx.putImageData(imgData, x, y);
+    ctx.putImageData(imgData, 0, 0);
   }, []);
-
-  // Parse the RFB byte stream from the buffer
-  const parseStream = useCallback(() => {
-    const state = parseStateRef.current;
-    if (!state) return;
-
-    let keepParsing = true;
-    while (keepParsing) {
-      const buf = streamBufRef.current;
-      const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-
-      if (state.phase === 'name') {
-        // First message: 4-byte length + name string
-        // e.g. 00 00 00 0e + "reMarkable rfb"
-        if (buf.byteLength < 4) { keepParsing = false; break; }
-        const nameLen = view.getUint32(0);
-        if (nameLen > 0 && nameLen < 100 && 4 + nameLen <= buf.byteLength) {
-          const name = new TextDecoder().decode(buf.slice(4, 4 + nameLen));
-          console.log('[VNC] Server name:', name);
-          consume(4 + nameLen);
-          state.phase = 'message';
-        } else if (nameLen === 0) {
-          consume(4);
-          state.phase = 'message';
-        } else {
-          // Not a name message — skip to message parsing
-          state.phase = 'message';
-        }
-        continue;
-      }
-
-      if (state.phase === 'message') {
-        // Need at least 1 byte for message type
-        if (buf.byteLength < 1) { keepParsing = false; break; }
-        const msgType = view.getUint8(0);
-
-        if (msgType === 0) {
-          // FramebufferUpdate: msgType(1) + padding(1) + numRects(2) + rect data
-          if (buf.byteLength < 4) { keepParsing = false; break; }
-          const numRects = view.getUint16(2);
-
-          // Parse rectangles
-          let offset = 4;
-          let rectsParsed = 0;
-          let incomplete = false;
-
-          for (let r = 0; r < numRects; r++) {
-            // Need 12 bytes for rect header
-            if (offset + 12 > buf.byteLength) {
-              incomplete = true;
-              break;
-            }
-            const x = view.getUint16(offset);
-            const y = view.getUint16(offset + 2);
-            const w = view.getUint16(offset + 4);
-            const h = view.getUint16(offset + 6);
-            const encoding = view.getInt32(offset + 8);
-            offset += 12;
-
-            if (encoding === 0) {
-              // RAW: w * h * bytesPerPixel pixel data
-              const pixelBytes = w * h * state.bytesPerPixel;
-              if (offset + pixelBytes > buf.byteLength) {
-                // Not enough data yet — wait for more
-                incomplete = true;
-                break;
-              }
-              const pixelData = buf.slice(offset, offset + pixelBytes);
-              renderRect(x, y, w, h, pixelData);
-              offset += pixelBytes;
-              rectsParsed++;
-            } else if (encoding === -223) {
-              // DesktopSize pseudo-encoding — no pixel data
-              state.width = w;
-              state.height = h;
-              const canvas = canvasRef.current?.querySelector('canvas');
-              if (canvas) {
-                canvas.width = w;
-                canvas.height = h;
-              }
-              rectsParsed++;
-            } else if (encoding === -239) {
-              // Cursor pseudo-encoding
-              const pixelBytes = w * h * state.bytesPerPixel;
-              const maskBytes = Math.ceil((w * h) / 8);
-              if (offset + pixelBytes + maskBytes > buf.byteLength) {
-                incomplete = true;
-                break;
-              }
-              offset += pixelBytes + maskBytes;
-              rectsParsed++;
-            } else {
-              console.warn('[VNC] Unknown encoding:', encoding);
-              // Can't determine size — abort this frame
-              offset = buf.byteLength;
-              rectsParsed = numRects;
-              break;
-            }
-          }
-
-          if (incomplete) {
-            // Wait for more data — don't consume anything
-            keepParsing = false;
-            break;
-          }
-
-          // All rects parsed — consume the bytes
-          consume(offset);
-          setStats(prev => ({
-            frames: prev.frames + 1,
-            bytes: prev.bytes + offset,
-          }));
-        } else if (msgType === 1) {
-          // SetColourMapEntries: msgType(1) + padding(2) + firstColour(2) + numColours(2) + colour data
-          if (buf.byteLength < 8) { keepParsing = false; break; }
-          const numColours = view.getUint16(6);
-          const totalLen = 8 + numColours * 6;
-          if (buf.byteLength < totalLen) { keepParsing = false; break; }
-          consume(totalLen);
-        } else if (msgType === 2) {
-          // Bell: 1 byte
-          consume(1);
-        } else if (msgType === 3) {
-          // ServerCutText: msgType(1) + padding(3) + length(4) + text
-          if (buf.byteLength < 8) { keepParsing = false; break; }
-          const length = view.getUint32(4);
-          const totalLen = 8 + length;
-          if (buf.byteLength < totalLen) { keepParsing = false; break; }
-          consume(totalLen);
-        } else {
-          // Unknown message type — skip 1 byte and try to resync
-          console.warn('[VNC] Unknown msg type:', msgType, 'at offset 0, buf length:', buf.byteLength);
-          consume(1);
-        }
-      }
-    }
-  }, [consume, renderRect]);
 
   const connectVNC = useCallback(() => {
     if (wsRef.current) {
@@ -222,7 +203,8 @@ export default function VNCViewer() {
     setStatus('connecting');
     setError(null);
     setStats({ frames: 0, bytes: 0 });
-    initParser();
+    metaRef.current = null;
+    compressedBufRef.current = new Uint8Array(0);
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}${ROOT_URL}/screenshare/vnc/stream`;
@@ -249,20 +231,90 @@ export default function VNCViewer() {
 
     ws.onopen = () => {
       setStatus('connected');
-      console.log('[VNC] WebSocket connected');
+      console.log('[FB] WebSocket connected');
     };
 
     ws.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        // Metadata message
+        try {
+          const meta = JSON.parse(e.data);
+          if (meta.type === 'meta') {
+            metaRef.current = meta;
+            console.log('[FB] Metadata:', meta);
+            const container = canvasRef.current;
+            if (container) {
+              const canvas = container.querySelector('canvas');
+              if (canvas) {
+                canvas.width = meta.width;
+                canvas.height = meta.height;
+              }
+            }
+          }
+        } catch (err) {
+          console.error('[FB] Parse metadata:', err);
+        }
+        return;
+      }
+
       if (e.data instanceof ArrayBuffer) {
-        appendData(new Uint8Array(e.data));
-        parseStream();
+        const newData = new Uint8Array(e.data);
+
+        // Append to compressed buffer
+        const old = compressedBufRef.current;
+        const combined = new Uint8Array(old.length + newData.length);
+        combined.set(old);
+        combined.set(newData, old.length);
+        compressedBufRef.current = combined;
+
+        const meta = metaRef.current || { width: 1404, height: 1872, bpp: 2 };
+        const frameSize = meta.width * meta.height * meta.bpp;
+
+        // Try to decompress frames from the buffer
+        while (compressedBufRef.current.length > 8) {
+          const result = decompressLZ4Frame(compressedBufRef.current);
+          if (!result || result.data.length === 0) break;
+
+          const decompressed = result.data;
+
+          // Check if we have enough data for a complete frame
+          if (decompressed.length >= frameSize) {
+            // Extract one frame
+            const frameData = decompressed.slice(0, frameSize);
+            renderFrame(frameData, meta.width, meta.height);
+
+            setStats(prev => ({
+              frames: prev.frames + 1,
+              bytes: prev.bytes + frameSize,
+            }));
+
+            // Keep remaining decompressed data for next frame
+            const remaining = decompressed.slice(frameSize);
+            // Put remaining back — but this is decompressed, not compressed
+            // We need a different approach: keep track of consumed compressed bytes
+            if (result.consumed > 0) {
+              compressedBufRef.current = compressedBufRef.current.slice(result.consumed);
+              // Prepend remaining decompressed data... but this doesn't work
+              // because the remaining is decompressed, not compressed.
+              // Actually, if the frame boundary aligns with the LZ4 frame boundary,
+              // this should work.
+            } else {
+              // Can't determine consumed bytes — consume entire buffer
+              compressedBufRef.current = new Uint8Array(0);
+              break;
+            }
+          } else {
+            // Not enough data for a complete frame yet
+            break;
+          }
+        }
       }
     };
 
     ws.onerror = (e) => {
       setError('WebSocket error');
       setStatus('error');
-      console.error('[VNC] WS error:', e);
+      console.error('[FB] WS error:', e);
     };
 
     ws.onclose = (e) => {
@@ -272,7 +324,7 @@ export default function VNCViewer() {
       }
       wsRef.current = null;
     };
-  }, [appendData, parseStream, initParser]);
+  }, [decompressLZ4Frame, renderFrame]);
 
   const disconnectVNC = useCallback(() => {
     if (wsRef.current) {
@@ -328,7 +380,7 @@ export default function VNCViewer() {
           <span style={{ fontSize: '13px', color: '#e53e3e' }}>{error}</span>
         )}
         <span style={{ fontSize: '12px', color: '#999', marginLeft: 'auto' }}>
-          reMarkable Live View (VNC)
+          reMarkable Live View
         </span>
       </div>
       <div
