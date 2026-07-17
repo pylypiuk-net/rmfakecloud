@@ -70,7 +70,10 @@ func main() {
 	}
 
 	// Start restream as subprocess
-	cmd := exec.Command(restreamBin, "-w", "1404", "-h", "1872", "-b", "2", "-f", ":mem:")
+	// reMarkable 2 firmware ≥3.24: 4bpp BGRA, 1872×1404 (landscape), LZ4 compressed
+	// reStream.sh: width=1872, height=1404, bytes_per_pixel=4, pixel_format=bgra
+	// transpose=2 (rotate 180°), skip_offset=4705256 (firmware ≥3.27)
+	cmd := exec.Command(restreamBin, "-w", "1872", "-h", "1404", "-b", "4", "-f", ":mem:")
 	cmd.Env = []string{"PATH=/opt/bin:/usr/bin:/bin"}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -1,31 +1,36 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import lz4 from 'lz4js';
 
 const ROOT_URL = '/ui/api';
 
 // Framebuffer viewer for reMarkable screen sharing.
 // The proxy (fbproxy) runs `restream` on the tablet which captures xochitl's
-// framebuffer from process memory (ptrace) and sends raw RGB565 frames
-// over WebSocket via the VNCHub.
+// framebuffer from process memory (ptrace) and sends LZ4-compressed BGRA
+// frames over WebSocket via the VNCHub.
+//
+// Format: 1872×1404 BGRA (4bpp), LZ4 compressed, rotate 180° (transpose=2)
+// E-ink: 0x00000000 = white, 0xFFFFFFFF = black → invert
 //
 // Protocol:
-//   - All messages are binary (VNCHub only forwards binary)
-//   - Messages are chunks of raw RGB565 pixel data
-//   - Accumulate until we have a full frame (1404×1872×2 = 5,253,576 bytes)
-//   - Render with e-ink color inversion (0x0000=white, 0xFFFF=black)
+//   - All WS messages are binary (VNCHub only forwards binary)
+//   - Messages are LZ4-compressed chunks of BGRA pixel data
+//   - Accumulate compressed data, decompress LZ4 frames, render BGRA→RGBA
 export default function VNCViewer() {
   const canvasRef = useRef(null);
   const wsRef = useRef(null);
-  const frameBufRef = useRef(null);
+  const compressedBufRef = useRef(null);
   const [status, setStatus] = useState('disconnected');
   const [error, setError] = useState(null);
   const [stats, setStats] = useState({ frames: 0, bytes: 0 });
 
-  const WIDTH = 1404;
-  const HEIGHT = 1872;
-  const BPP = 2;
-  const FRAME_SIZE = WIDTH * HEIGHT * BPP;
+  // reMarkable 2 firmware ≥3.24: landscape BGRA, rotate 180°
+  const FB_WIDTH = 1872;
+  const FB_HEIGHT = 1404;
+  const BPP = 4;
+  const FRAME_SIZE = FB_WIDTH * FB_HEIGHT * BPP;
+  const LZ4_MAGIC = 0x184d2204;
 
-  // Render RGB565 data to canvas
+  // Render BGRA data to canvas with 180° rotation and e-ink inversion
   const renderFrame = useCallback((pixelData) => {
     const container = canvasRef.current;
     if (!container) return;
@@ -33,22 +38,38 @@ export default function VNCViewer() {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
 
-    const numPixels = WIDTH * HEIGHT;
-    const imgData = ctx.createImageData(WIDTH, HEIGHT);
+    // Canvas is portrait (1404×1872) — the tablet's physical orientation
+    const canvasW = 1404;
+    const canvasH = 1872;
+    if (canvas.width !== canvasW) canvas.width = canvasW;
+    if (canvas.height !== canvasH) canvas.height = canvasH;
+
+    const imgData = ctx.createImageData(canvasW, canvasH);
     const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
 
-    for (let i = 0; i < numPixels; i++) {
-      const offset = i * 2;
-      if (offset + 1 >= view.byteLength) break;
-      const pixel = view.getUint16(offset, true); // little-endian
-      const r = (pixel >> 11) & 0x1f;
-      const g = (pixel >> 5) & 0x3f;
-      const b = pixel & 0x1f;
-      // E-ink: 0x0000 = white, 0xFFFF = black → invert
-      imgData.data[i * 4] = 255 - ((r << 3) | (r >> 2));
-      imgData.data[i * 4 + 1] = 255 - ((g << 2) | (g >> 4));
-      imgData.data[i * 4 + 2] = 255 - ((b << 3) | (b >> 2));
-      imgData.data[i * 4 + 3] = 255;
+    // Source: 1872×1404 BGRA, rotated 180° → destination: 1404×1872
+    // transpose=2 means: dst[y][x] = src[height-1-y][width-1-x]
+    for (let y = 0; y < canvasH; y++) {
+      for (let x = 0; x < canvasW; x++) {
+        // Map portrait coords to landscape with 180° rotation
+        const srcX = FB_WIDTH - 1 - x;
+        const srcY = FB_HEIGHT - 1 - y;
+        const srcOffset = (srcY * FB_WIDTH + srcX) * BPP;
+
+        if (srcOffset + 3 >= view.byteLength) continue;
+
+        // BGRA: B, G, R, A
+        const b = view.getUint8(srcOffset);
+        const g = view.getUint8(srcOffset + 1);
+        const r = view.getUint8(srcOffset + 2);
+
+        // E-ink: 0=white, 255=black → invert
+        const dstIdx = (y * canvasW + x) * 4;
+        imgData.data[dstIdx] = 255 - r;
+        imgData.data[dstIdx + 1] = 255 - g;
+        imgData.data[dstIdx + 2] = 255 - b;
+        imgData.data[dstIdx + 3] = 255;
+      }
     }
 
     ctx.putImageData(imgData, 0, 0);
@@ -63,7 +84,7 @@ export default function VNCViewer() {
     setStatus('connecting');
     setError(null);
     setStats({ frames: 0, bytes: 0 });
-    frameBufRef.current = new Uint8Array(0);
+    compressedBufRef.current = new Uint8Array(0);
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}${ROOT_URL}/screenshare/vnc/stream`;
@@ -79,8 +100,8 @@ export default function VNCViewer() {
     if (container) {
       container.innerHTML = '';
       const canvas = document.createElement('canvas');
-      canvas.width = WIDTH;
-      canvas.height = HEIGHT;
+      canvas.width = 1404;
+      canvas.height = 1872;
       canvas.style.maxWidth = '100%';
       canvas.style.maxHeight = '100%';
       canvas.style.imageRendering = 'pixelated';
@@ -97,26 +118,58 @@ export default function VNCViewer() {
       if (e.data instanceof ArrayBuffer) {
         const newData = new Uint8Array(e.data);
 
-        // Append to frame buffer
-        const old = frameBufRef.current;
+        // Append to compressed buffer
+        const old = compressedBufRef.current;
         const combined = new Uint8Array(old.length + newData.length);
         combined.set(old);
         combined.set(newData, old.length);
-        frameBufRef.current = combined;
+        compressedBufRef.current = combined;
 
-        // Check if we have enough data for a complete frame
-        while (frameBufRef.current.length >= FRAME_SIZE) {
-          // Extract one frame
-          const frameData = frameBufRef.current.slice(0, FRAME_SIZE);
-          renderFrame(frameData);
+        // Try to decompress complete LZ4 frames
+        let buf = compressedBufRef.current;
 
-          setStats(prev => ({
-            frames: prev.frames + 1,
-            bytes: prev.bytes + FRAME_SIZE,
-          }));
+        while (buf.length > 8) {
+          const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+          const magic = view.getUint32(0, true);
 
-          // Keep remaining data
-          frameBufRef.current = frameBufRef.current.slice(FRAME_SIZE);
+          if (magic !== LZ4_MAGIC) {
+            // Not LZ4 frame start — skip 1 byte
+            buf = buf.slice(1);
+            continue;
+          }
+
+          // Try to decompress
+          try {
+            const decompressed = lz4.decompress(buf);
+            if (decompressed && decompressed.length >= FRAME_SIZE) {
+              // We have at least one complete frame
+              const frameData = decompressed.slice(0, FRAME_SIZE);
+              renderFrame(frameData);
+
+              setStats(prev => ({
+                frames: prev.frames + 1,
+                bytes: prev.bytes + decompressed.length,
+              }));
+
+              // Consume the compressed data we used
+              // lz4.decompress consumes the entire input, so we reset the buffer
+              compressedBufRef.current = new Uint8Array(0);
+              break;
+            } else if (decompressed && decompressed.length > 0) {
+              // Partial frame — wait for more data
+              break;
+            } else {
+              buf = buf.slice(1);
+              continue;
+            }
+          } catch (err) {
+            // Incomplete LZ4 frame — wait for more data
+            break;
+          }
+        }
+
+        if (buf !== compressedBufRef.current) {
+          compressedBufRef.current = buf;
         }
       }
     };
