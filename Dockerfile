@@ -1,9 +1,9 @@
 ARG VERSION=0.0.0
 FROM --platform=$BUILDPLATFORM node:lts AS uibuilder
-RUN find /var/lib/dpkg /usr/lib -name '*.dpkg-tmp' -delete 2>/dev/null; rm -rf /var/lib/dpkg/tmp.ci
+RUN rm -rf /var/lib/dpkg/tmp.ci /var/lib/dpkg/updates /var/cache/debconf
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable pnpm && corepack install -g pnpm@latest-9 && find /var/lib/dpkg /usr/lib -name '*.dpkg-tmp' -delete 2>/dev/null; rm -rf /var/lib/dpkg/tmp.ci
+RUN corepack enable pnpm && corepack install -g pnpm@latest-9 && rm -rf /var/lib/dpkg/tmp.ci /var/lib/dpkg/updates /var/cache/debconf
 
 WORKDIR /src
 #COPY ui/package.json ui/pnpm-lock.yaml /src
