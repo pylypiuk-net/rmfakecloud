@@ -11,13 +11,17 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -36,17 +40,18 @@ const (
 )
 
 func main() {
-	userID := os.Getenv("USER_ID")
-	if userID == "" && len(os.Args) > 1 {
-		userID = os.Args[1]
-	}
-	if userID == "" {
-		log.Fatal("USER_ID required (first arg or env)")
-	}
-
 	deviceToken := os.Getenv("DEVICE_TOKEN")
 	if deviceToken == "" && len(os.Args) > 2 {
 		deviceToken = os.Args[2]
+	}
+
+	// Extract auth0-userid from the JWT
+	userID := os.Getenv("USER_ID")
+	if userID == "" {
+		userID = extractUserID(deviceToken)
+	}
+	if userID == "" {
+		log.Fatal("USER_ID required (env, arg, or extractable from DEVICE_TOKEN JWT)")
 	}
 
 	serverHost := os.Getenv("SERVER_HOST")
@@ -196,6 +201,14 @@ func rfbHandshake(conn *tls.Conn, challenge []byte) error {
 
 	if useRMAuth {
 		conn.Write([]byte{100})
+		
+		// Server sends 4 bytes (challenge prompt/nonce) — MUST read before sending our challenge
+		serverPrompt := make([]byte, 4)
+		if _, err := io.ReadFull(conn, serverPrompt); err != nil {
+			return fmt.Errorf("read RM_AUTH prompt: %w", err)
+		}
+		log.Printf("  RM_AUTH server prompt: %x", serverPrompt)
+		
 		// Send challenge length (4 bytes) + challenge (32 bytes)
 		lenBuf := make([]byte, 4)
 		binary.BigEndian.PutUint32(lenBuf, uint32(len(challenge)))
@@ -235,15 +248,18 @@ func rfbHandshake(conn *tls.Conn, challenge []byte) error {
 	// Send ClientInit (shared=1)
 	conn.Write([]byte{1})
 
-	// Read ServerInit (24 bytes)
+	// Read ServerInit (24 bytes) with timeout
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	header := make([]byte, 24)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return fmt.Errorf("read serverinit: %w", err)
 	}
+	conn.SetReadDeadline(time.Time{}) // reset deadline
 	width := binary.BigEndian.Uint16(header[0:2])
 	height := binary.BigEndian.Uint16(header[2:4])
 	nameLen := binary.BigEndian.Uint32(header[20:24])
 	log.Printf("  FB: %dx%d, nameLen=%d", width, height, nameLen)
+	log.Printf("  ServerInit raw: %x", header)
 
 	// Read server name if present
 	if nameLen > 0 && nameLen < 1024 {
@@ -251,21 +267,42 @@ func rfbHandshake(conn *tls.Conn, challenge []byte) error {
 		io.ReadFull(conn, name)
 		log.Printf("  Name: %s", string(name))
 	} else if nameLen == 0 {
-		// reMarkable may send name as a separate frame — try reading it
-		// The first data after ServerInit might be the name
-		// Actually, the 18 bytes we saw ("reMarkable rfb") might be
-		// a FramebufferUpdate or a custom message. Let's read it.
-		// We'll handle it in the stream parsing.
-		log.Printf("  No name in ServerInit, will parse stream")
+		log.Printf("  No name in ServerInit, proceeding")
 	}
 
+	log.Printf("  Handshake complete, starting stream...")
 	return nil
 }
 
 func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string) {
 	defer rfbConn.Close()
+	log.Printf("pipeRFBStream: starting, server=%s:%s", serverHost, serverPort)
 
-	// Send SetEncodings: message-type=2, padding=0, count=6, encodings
+	// Send SetPixelFormat: RGB565 (16bpp, 16bit depth, truecolor)
+	// The reMarkable's ServerInit has a garbage pixel format, so we need
+	// to explicitly set RGB565: red_max=31, green_max=63, blue_max=31,
+	// red_shift=11, green_shift=5, blue_shift=0
+	pixFmt := make([]byte, 20)
+	pixFmt[0] = 0 // SetPixelFormat
+	// padding bytes 1-3 = 0
+	pixFmt[4] = 16 // bpp
+	pixFmt[5] = 16 // depth
+	pixFmt[6] = 0  // big-endian
+	pixFmt[7] = 1  // true-color
+	binary.BigEndian.PutUint16(pixFmt[8:10], 31)   // red-max
+	binary.BigEndian.PutUint16(pixFmt[10:12], 63)  // green-max
+	binary.BigEndian.PutUint16(pixFmt[12:14], 31)  // blue-max
+	pixFmt[14] = 11 // red-shift
+	pixFmt[15] = 5  // green-shift
+	pixFmt[16] = 0  // blue-shift
+	// padding bytes 17-19 = 0
+	if _, err := rfbConn.Write(pixFmt); err != nil {
+		log.Printf("SetPixelFormat: %v", err)
+		return
+	}
+	log.Printf("Sent SetPixelFormat: RGB565 (16bpp)")
+
+	// Send SetEncodings: message-type=2, padding=0, count=3, encodings
 	encodings := []int32{
 		RAW_ENCODING,
 		PSEUDO_DESKTOPSIZE,
@@ -284,14 +321,16 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	}
 	log.Printf("Sent SetEncodings: %v", encodings)
 
-	// Send FramebufferUpdateRequest: type=3, incremental=0, x=0, y=0, w=0, h=0
+	// Send FramebufferUpdateRequest: request full screen
+	// reMarkable screen is 1404x1872. The ServerInit returned 0x0,
+	// so we need to specify the actual dimensions.
 	fbReq := make([]byte, 10)
 	fbReq[0] = 3 // FramebufferUpdateRequest
 	fbReq[1] = 0 // non-incremental
-	binary.BigEndian.PutUint16(fbReq[2:4], 0) // x
-	binary.BigEndian.PutUint16(fbReq[4:6], 0) // y
-	binary.BigEndian.PutUint16(fbReq[6:8], 0) // width (0 = full)
-	binary.BigEndian.PutUint16(fbReq[8:10], 0) // height (0 = full)
+	binary.BigEndian.PutUint16(fbReq[2:4], 0)    // x
+	binary.BigEndian.PutUint16(fbReq[4:6], 0)    // y
+	binary.BigEndian.PutUint16(fbReq[6:8], 1404) // width
+	binary.BigEndian.PutUint16(fbReq[8:10], 1872) // height
 	if _, err := rfbConn.Write(fbReq); err != nil {
 		log.Printf("FBUpdateRequest: %v", err)
 		return
@@ -327,8 +366,8 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				done <- struct{}{}
 				return
 			}
-			if totalBytes < 500 {
-				log.Printf("  RFB->WS: %d bytes: %x", n, buf[:min(n, 32)])
+			if totalBytes < 5000 || totalBytes%100000 < 65536 {
+				log.Printf("  RFB->WS: %d bytes (total=%d), first: %x", n, totalBytes, buf[:min(n, 16)])
 			}
 			// After each frame, request incremental update
 			fbReq[1] = 1 // incremental
@@ -360,4 +399,29 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// extractUserID extracts auth0-userid from a JWT token
+func extractUserID(jwt string) string {
+	parts := strings.Split(jwt, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload := parts[1]
+	// Add padding
+	for len(payload)%4 != 0 {
+		payload += "="
+	}
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return ""
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(data, &claims); err != nil {
+		return ""
+	}
+	if uid, ok := claims["auth0-userid"].(string); ok {
+		return uid
+	}
+	return ""
 }

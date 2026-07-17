@@ -183,6 +183,7 @@ func (app *App) newUserToken(c *gin.Context) {
 	now := time.Now()
 	expirationTime := now.Add(3 * time.Hour)
 	claims := &UserClaims{
+		UserID: deviceToken.UserID,
 		Profile: Auth0profile{
 			UserID:        deviceToken.UserID,
 			IsSocial:      false,

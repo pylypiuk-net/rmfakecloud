@@ -17,6 +17,7 @@ type DeviceClaims struct {
 
 // UserClaims is the oauth token struct.
 type UserClaims struct {
+	UserID     string       `json:"auth0-userid"`
 	Profile    Auth0profile `json:"auth0-profile,omitempty"`
 	DeviceDesc string       `json:"device-desc"`
 	DeviceID   string       `json:"device-id"`
