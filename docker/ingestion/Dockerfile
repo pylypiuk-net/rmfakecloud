@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.12-slim
 
 # Install system deps for pycairo + runtime libcairo2
 RUN apt-get update && \
