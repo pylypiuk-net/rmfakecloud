@@ -1,9 +1,8 @@
 ARG VERSION=0.0.0
-FROM --platform=$BUILDPLATFORM node:lts AS uibuilder
-RUN rm -rf /var/lib/dpkg/tmp.ci /var/lib/dpkg/updates /var/cache/debconf
+FROM --platform=$BUILDPLATFORM node:lts-alpine AS uibuilder
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable pnpm && corepack install -g pnpm@latest-9 && rm -rf /var/lib/dpkg/tmp.ci /var/lib/dpkg/updates /var/cache/debconf
+RUN corepack enable pnpm && corepack install -g pnpm@latest-9
 
 WORKDIR /src
 #COPY ui/package.json ui/pnpm-lock.yaml /src
