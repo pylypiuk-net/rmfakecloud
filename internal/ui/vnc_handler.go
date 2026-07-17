@@ -28,7 +28,7 @@ var upgraderVNC = websocket.Upgrader{
 
 // vnHub bridges the tablet VNC proxy to web UI viewers.
 var vnHub = &VNCHub{
-	broadcast: make(chan []byte, 256),
+	broadcast: make(chan []byte, 4096),
 	register:  make(chan *websocket.Conn, 1),
 }
 
@@ -139,12 +139,8 @@ func (app *ReactAppWrapper) vncProxyConnectHandler(c *gin.Context) {
 			break
 		}
 		if msgType == websocket.BinaryMessage {
-			select {
-			case vnHub.broadcast <- data:
-			default:
-				// buffer full, drop frame
+				vnHub.broadcast <- data
 			}
-		}
 	}
 
 	log.Info("[vnc-proxy] tablet proxy disconnected")
