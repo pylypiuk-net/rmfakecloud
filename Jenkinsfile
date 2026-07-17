@@ -56,13 +56,15 @@ pipeline {
                 stage('Build rm-ingestion') {
                     steps {
                         container('kaniko') {
-                            sh '''
-                            /kaniko/executor --dockerfile `pwd`/docker/ingestion/Dockerfile \
-                                             --context `pwd`/docker/ingestion \
-                                             --destination=${REGISTRY}/jenkins/rm-ingestion:v0.${BUILD_NUMBER} \
-                                             --destination=${REGISTRY}/jenkins/rm-ingestion:latest \
-                                             --skip-tls-verify
-                            '''
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                                sh '''
+                                /kaniko/executor --dockerfile `pwd`/docker/ingestion/Dockerfile \
+                                                 --context `pwd`/docker/ingestion \
+                                                 --destination=${REGISTRY}/jenkins/rm-ingestion:v0.${BUILD_NUMBER} \
+                                                 --destination=${REGISTRY}/jenkins/rm-ingestion:latest \
+                                                 --skip-tls-verify
+                                '''
+                            }
                         }
                     }
                 }
