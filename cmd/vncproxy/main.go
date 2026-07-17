@@ -70,11 +70,13 @@ func main() {
 
 	log.Printf("vncproxy starting: userID=%s server=%s:%s listen=:%s", userID, serverHost, serverPort, listenPort)
 
-	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
+	// Must bind to IPv4 explicitly — Go defaults to IPv6 which doesn't receive IPv4 broadcasts
+	listenAddr := net.IPv4zero.String() + ":" + listenPort
+	addr, err := net.ResolveUDPAddr("udp4", listenAddr)
 	if err != nil {
 		log.Fatalf("resolve udp: %v", err)
 	}
-	conn, err := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
 		log.Fatalf("listen udp: %v", err)
 	}
@@ -368,6 +370,10 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			}
 			if totalBytes < 5000 || totalBytes%100000 < 65536 {
 				log.Printf("  RFB->WS: %d bytes (total=%d), first: %x", n, totalBytes, buf[:min(n, 16)])
+			}
+			// Log the very first message in detail
+			if totalBytes == n {
+				log.Printf("  FIRST MESSAGE (full hex, %d bytes): %x", n, buf[:min(n, 64)])
 			}
 			// After each frame, request incremental update
 			fbReq[1] = 1 // incremental

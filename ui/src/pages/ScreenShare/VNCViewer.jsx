@@ -22,8 +22,10 @@ export default function VNCViewer() {
       width: 1404,
       height: 1872,
       bytesPerPixel: 2,
-      // Parser state: 'name' (skip initial name msg), then 'message'
-      phase: 'name',
+      // Parser state: start directly at 'message' phase — the proxy
+      // already consumed ServerInit during the RFB handshake, so the
+      // viewer only receives FramebufferUpdate messages.
+      phase: 'message',
       nameBytesRemaining: 0,
     };
   }, []);
