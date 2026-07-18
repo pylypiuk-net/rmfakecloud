@@ -233,6 +233,7 @@ export default function VNCViewer() {
     const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
     if (pixelData.byteLength < 4) return;
     const zlibLen = view.getUint32(0);
+    console.log('[VNC] ZRLE rect:', x, y, w, h, 'zlibLen:', zlibLen, 'dataLen:', pixelData.byteLength);
     if (4 + zlibLen > pixelData.byteLength) {
       console.warn('[VNC] ZRLE: incomplete zlib data, need', 4 + zlibLen, 'have', pixelData.byteLength);
       return;
@@ -244,15 +245,22 @@ export default function VNCViewer() {
       if (!state.zrleInflate) {
         state.zrleInflate = new pako.Inflate({ raw: false });
       }
+      // ZRLE uses a continuous zlib stream. push with sync mode to get
+      // available output without finalizing the stream.
       state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), false);
       decompressed = state.zrleInflate.result;
+      console.log('[VNC] ZRLE inflate result:', decompressed ? decompressed.length : 'null', 'bytes');
       if (!decompressed || decompressed.length === 0) {
-        // Some incremental frames produce no output yet (need more data)
-        return;
+        // pako may buffer internally. Try flushing by pushing an empty
+        // sync flush marker (Z_SYNC_FLUSH = \x00\x00\xff\xff)
+        state.zrleInflate.push(new Uint8Array([0x00, 0x00, 0xff, 0xff]), false);
+        decompressed = state.zrleInflate.result;
+        if (!decompressed || decompressed.length === 0) {
+          return; // need more data
+        }
       }
     } catch (e) {
       console.warn('[VNC] ZRLE inflate failed:', e);
-      // Reset inflate on error — next full frame will restart the stream
       state.zrleInflate = null;
       return;
     }
