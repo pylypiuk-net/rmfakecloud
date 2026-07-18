@@ -118,14 +118,30 @@ func main() {
 	cmd := exec.Command(restreamBin, "-w", "1872", "-h", "1404", "-b", "1", "-s", "8", "-f", ":mem:")
 	cmd.Env = []string{"PATH=/opt/bin:/usr/bin:/bin"}
 
-	// Open the FIFO for writing. On Linux, opening a FIFO O_RDWR doesn't block
-	// (unlike O_WRONLY which blocks until a reader opens).
-	fifoWrite, err := os.OpenFile(fifoPath, os.O_RDWR, 0)
-	if err != nil {
-		log.Fatalf("open FIFO for writing: %v", err)
+	// Open the FIFO. On Linux, O_RDONLY blocks until O_WRONLY opens and vice versa,
+	// so we open both in goroutines. Must use O_WRONLY (not O_RDWR) so restream
+	// detects a proper FIFO and outputs LZ4 frames.
+	type fifoResult struct {
+		f   *os.File
+		err error
 	}
-	defer fifoWrite.Close()
-	cmd.Stdout = fifoWrite
+	writeCh := make(chan fifoResult, 1)
+	readCh := make(chan fifoResult, 1)
+	go func() {
+		fw, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+		writeCh <- fifoResult{fw, err}
+	}()
+	go func() {
+		fr, err := os.Open(fifoPath)
+		readCh <- fifoResult{fr, err}
+	}()
+
+	wr := <-writeCh
+	if wr.err != nil {
+		log.Fatalf("open FIFO for writing: %v", wr.err)
+	}
+	defer wr.f.Close()
+	cmd.Stdout = wr.f
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -154,19 +170,17 @@ func main() {
 	frameCount := 0
 	totalBytes := 0
 
-	// Open the FIFO for reading (this may block if no writer — use the same O_RDWR fd)
-	// Actually we already have the FIFO open O_RDWR, so we can read from the same fd.
-	// But restream writes to it via cmd.Stdout. Let's open a separate read fd.
-	f, err := os.Open(fifoPath)
-	if err != nil {
-		log.Fatalf("open FIFO for reading: %v", err)
+	// Wait for the read end of the FIFO to open
+	rr := <-readCh
+	if rr.err != nil {
+		log.Fatalf("open FIFO for reading: %v", rr.err)
 	}
-	defer f.Close()
+	defer rr.f.Close()
 
 	buf := make([]byte, 65536)
 
 	for {
-		n, err := f.Read(buf)
+		n, err := rr.f.Read(buf)
 		if n > 0 {
 			data := buf[:n]
 			if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, data); wsErr != nil {
