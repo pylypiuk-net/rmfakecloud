@@ -247,18 +247,15 @@ export default function VNCViewer() {
       }
       // ZRLE uses a continuous zlib stream. push with sync mode to get
       // available output without finalizing the stream.
-      state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), false);
+      // Try finalizing each chunk — the rM VNC server may send each
+      // FramebufferUpdate as a complete zlib stream (with header + finalization)
+      state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), true);
       decompressed = state.zrleInflate.result;
-      console.log('[VNC] ZRLE inflate result:', decompressed ? decompressed.length : 'null', 'bytes');
       if (!decompressed || decompressed.length === 0) {
-        // pako may buffer internally. Try flushing by pushing an empty
-        // sync flush marker (Z_SYNC_FLUSH = \x00\x00\xff\xff)
-        state.zrleInflate.push(new Uint8Array([0x00, 0x00, 0xff, 0xff]), false);
-        decompressed = state.zrleInflate.result;
-        if (!decompressed || decompressed.length === 0) {
-          return; // need more data
-        }
+        return; // no output available
       }
+      // Reset for next frame (we finalize each chunk)
+      state.zrleInflate = null;
     } catch (e) {
       console.warn('[VNC] ZRLE inflate failed:', e);
       state.zrleInflate = null;
