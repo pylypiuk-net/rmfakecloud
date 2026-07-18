@@ -19,6 +19,7 @@ export default function VNCViewer() {
   const parseStateRef = useRef(null);
   const manualDisconnectRef = useRef(false);
   const reconnectRef = useRef(null);
+  const reconnectFnRef = useRef(null);
   const [status, setStatus] = useState('disconnected');
   const [error, setError] = useState(null);
   const [stats, setStats] = useState({ frames: 0, bytes: 0 });
@@ -584,14 +585,19 @@ export default function VNCViewer() {
       // Auto-reconnect after 2s if we didn't manually disconnect
       if (!manualDisconnectRef.current) {
         reconnectRef.current = setTimeout(() => {
-          if (!manualDisconnectRef.current) {
+          if (!manualDisconnectRef.current && reconnectFnRef.current) {
             console.log('[VNC] Auto-reconnecting...');
-            connectVNC();
+            reconnectFnRef.current();
           }
         }, 2000);
       }
     };
-  }, [appendData, parseStream, initParser, connectVNC]);
+  }, [appendData, parseStream, initParser]);
+
+  // Store the connect function in a ref for reconnect
+  useEffect(() => {
+    reconnectFnRef.current = connectVNC;
+  }, [connectVNC]);
 
   const disconnectVNC = useCallback(() => {
     manualDisconnectRef.current = true;
