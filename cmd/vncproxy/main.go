@@ -460,7 +460,7 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				done <- struct{}{}
 				return
 			}
-			if totalBytes < 5000 || totalBytes%100000 < 65536 {
+			if totalBytes < 5*1024*1024 { // log first 5MB
 				nonZero := 0
 				for i := 0; i < n; i++ {
 					if buf[i] != 0 {
@@ -472,6 +472,23 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			// After each read, request incremental update for next frame
 			fbReq[1] = 1 // incremental
 			rfbConn.Write(fbReq)
+		}
+	}()
+
+	// Keepalive: send periodic FramebufferUpdateRequest to prevent VNC server timeout
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fbReq[1] = 1 // incremental
+				if _, err := rfbConn.Write(fbReq); err != nil {
+					return
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
 
