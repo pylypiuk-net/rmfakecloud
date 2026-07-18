@@ -102,116 +102,41 @@ func main() {
 	}()
 
 	// Pipe restream stdout → WebSocket
-	// restream outputs LZ4 frames (magic: 04 22 4D 18). We buffer the stdout
-	// and only forward complete LZ4 frames so the viewer can decompress each
-	// WebSocket message independently.
+	// Simple approach: forward raw chunks. The viewer reassembles LZ4 frames.
 	frameCount := 0
 	totalBytes := 0
-	readBuf := make([]byte, 65536)
-	var accum []byte
+	buf := make([]byte, 65536)
 	reconnectAttempts := 0
 
-	// Helper: send a WebSocket message with reconnect logic
-	sendMsg := func(data []byte) error {
-		err := wsConn.WriteMessage(websocket.BinaryMessage, data)
-		if err != nil {
-			log.Printf("WS write: %v", err)
-			wsConn.Close()
-			for reconnectAttempts < 3 {
-				reconnectAttempts++
-				log.Printf("Reconnecting to WS (attempt %d)...", reconnectAttempts)
-				time.Sleep(2 * time.Second)
-				wsConn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
-				if err != nil {
-					log.Printf("Reconnect failed: %v", err)
-					continue
-				}
-				wsConn.WriteMessage(websocket.TextMessage, []byte(meta))
-				reconnectAttempts = 0
-				// Retry the send
-				err = wsConn.WriteMessage(websocket.BinaryMessage, data)
-				if err == nil {
-					return nil
-				}
-			}
-			if reconnectAttempts >= 3 {
-				log.Fatal("Max reconnect attempts reached")
-			}
-		}
-		return err
-	}
-
 	for {
-		n, err := stdout.Read(readBuf)
+		n, err := stdout.Read(buf)
 		if n > 0 {
-			accum = append(accum, readBuf[:n]...)
-
-			// Extract complete LZ4 frames.
-			// Search only in the new data + last 4 bytes (for magic spanning chunks)
-			for {
-				// Find the first LZ4 magic in the buffer
-				firstIdx := -1
-				for i := 0; i < len(accum)-3; i++ {
-					if accum[i] == 0x04 && accum[i+1] == 0x22 && accum[i+2] == 0x4D && accum[i+3] == 0x18 {
-						firstIdx = i
-						break
-					}
-				}
-				if firstIdx < 0 {
-					// No magic — keep only last 4 bytes in case magic spans a chunk
-					if len(accum) > 4 {
-						accum = accum[len(accum)-4:]
-					}
-					break
-				}
-
-				// Discard data before the magic
-				if firstIdx > 0 {
-					accum = accum[firstIdx:]
-				}
-
-				// Find the next magic (start of next frame)
-				nextIdx := -1
-				for i := 4; i < len(accum)-3; i++ {
-					if accum[i] == 0x04 && accum[i+1] == 0x22 && accum[i+2] == 0x4D && accum[i+3] == 0x18 {
-						nextIdx = i
-						break
-					}
-				}
-
-				if nextIdx < 0 {
-					// No next frame — wait for more data
-					// But if buffer is large (>5MB), send it as one frame
-					if len(accum) < 5*1024*1024 {
-						break
-					}
-					// Send the entire buffer as one frame
-					frameData := make([]byte, len(accum))
-					copy(frameData, accum)
-					accum = accum[:0]
-					if sendErr := sendMsg(frameData); sendErr != nil {
+			data := buf[:n]
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				log.Printf("WS write: %v", err)
+				wsConn.Close()
+				for reconnectAttempts < 3 {
+					reconnectAttempts++
+					log.Printf("Reconnecting to WS (attempt %d)...", reconnectAttempts)
+					time.Sleep(2 * time.Second)
+					wsConn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
+					if err != nil {
+						log.Printf("Reconnect failed: %v", err)
 						continue
 					}
-					frameCount++
-					totalBytes += len(frameData)
-					if frameCount%10 == 0 {
-						log.Printf("  streamed %d frames (total=%d bytes)", frameCount, totalBytes)
-					}
+					wsConn.WriteMessage(websocket.TextMessage, []byte(meta))
+					reconnectAttempts = 0
 					break
 				}
-
-				// Complete frame from 0 to nextIdx
-				frameData := make([]byte, nextIdx)
-				copy(frameData, accum[:nextIdx])
-				accum = accum[nextIdx:]
-				if sendErr := sendMsg(frameData); sendErr != nil {
-					continue
+				if reconnectAttempts >= 3 {
+					log.Fatal("Max reconnect attempts reached")
 				}
-				frameCount++
-				totalBytes += len(frameData)
-				if frameCount%10 == 0 {
-					log.Printf("  streamed %d frames (total=%d bytes)", frameCount, totalBytes)
-				}
+				continue
+			}
+			frameCount++
+			totalBytes += n
+			if frameCount%100 == 0 {
+				log.Printf("  streamed %d chunks (total=%d bytes)", frameCount, totalBytes)
 			}
 		}
 		if err == io.EOF {
