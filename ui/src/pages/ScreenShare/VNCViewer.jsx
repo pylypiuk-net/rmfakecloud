@@ -52,8 +52,9 @@ export default function VNCViewer() {
     streamBufRef.current = streamBufRef.current.slice(n);
   }, []);
 
-  // Convert a pixel value to RGBA with e-ink inversion.
-  // E-ink: 0 = white (no ink), max = black (full ink) → invert for RGB.
+  // Convert a pixel value to RGBA.
+  // Native VNC server sends standard RGB (0=black, max=white).
+  // No e-ink inversion needed — the VNC server already provides correct colors.
   const pixelToRGBA = useCallback((pixel, state) => {
     const r = (pixel >> state.redShift) & state.redMax;
     const g = (pixel >> state.greenShift) & state.greenMax;
@@ -64,8 +65,7 @@ export default function VNCViewer() {
     const g8 = Math.round((g / state.greenMax) * 255);
     const b8 = Math.round((b / state.blueMax) * 255);
 
-    // E-ink inversion: 0 → white (255), max → black (0)
-    return [255 - r8, 255 - g8, 255 - b8, 255];
+    return [r8, g8, b8, 255];
   }, []);
 
   // Render a RAW rectangle to canvas

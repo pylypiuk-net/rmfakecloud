@@ -437,6 +437,10 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	done := make(chan struct{}, 2)
 	totalBytes := 0
 
+	// Also save raw RFB data to file for offline analysis
+	rawFile, _ := os.Create("/tmp/rfb_raw.bin")
+	defer rawFile.Close()
+
 	// RFB -> WebSocket (binary messages)
 	go func() {
 		buf := make([]byte, 65536)
@@ -448,6 +452,9 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				return
 			}
 			totalBytes += n
+			if rawFile != nil {
+				rawFile.Write(buf[:n])
+			}
 			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
 				log.Printf("WS write ended: %v", err)
 				done <- struct{}{}
