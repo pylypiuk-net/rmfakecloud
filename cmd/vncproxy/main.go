@@ -8,7 +8,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"io"
 	"log"
 	"net"
@@ -111,14 +110,14 @@ func main() {
 		}
 	}()
 
-	// Tail the restream output file and forward LZ4 frames via WebSocket.
+	// Tail the restream output file and forward data via WebSocket.
 	// restream writes LZ4 frames (with magic 04 22 4D 18) to the file.
-	// We read complete frames and forward them so the viewer can decompress each one.
+	// We forward chunks; the viewer reassembles LZ4 frames.
 	frameCount := 0
 	totalBytes := 0
 
 	// Open the file for reading after restream starts writing to it
-	time.Sleep(100 * time.Millisecond) // give restream time to start
+	time.Sleep(500 * time.Millisecond) // give restream time to start
 	f, err := os.Open(tmpFile)
 	if err != nil {
 		log.Fatalf("open temp file for reading: %v", err)
@@ -126,73 +125,19 @@ func main() {
 	defer f.Close()
 
 	buf := make([]byte, 65536)
-	var accum []byte
 
 	for {
 		n, err := f.Read(buf)
 		if n > 0 {
-			accum = append(accum, buf[:n]...)
-
-			// Forward complete LZ4 frames (delimited by magic 04 22 4D 18)
-			for {
-				if len(accum) < 8 {
-					break
-				}
-				// Check if accum starts with LZ4 magic
-				if !bytes.HasPrefix(accum, []byte{0x04, 0x22, 0x4D, 0x18}) {
-					// Find magic in buffer using bytes.Index (SIMD-optimized)
-					idx := bytes.Index(accum, []byte{0x04, 0x22, 0x4D, 0x18})
-					if idx < 0 {
-						// Keep last 4 bytes (magic may span reads)
-						if len(accum) > 4 {
-							accum = accum[len(accum)-4:]
-						}
-						break
-					}
-					accum = accum[idx:]
-				}
-
-				// Find next magic using bytes.Index (search from position 4)
-				nextMagic := bytes.Index(accum[4:], []byte{0x04, 0x22, 0x4D, 0x18})
-				if nextMagic >= 0 {
-					nextMagic += 4
-				}
-
-				if nextMagic < 0 {
-					// No next frame yet — wait for more data
-					// But if we have >5MB, send it as one frame
-					if len(accum) < 5*1024*1024 {
-						break
-					}
-					// Send as one frame
-					frameData := make([]byte, len(accum))
-					copy(frameData, accum)
-					accum = accum[:0]
-					if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, frameData); wsErr != nil {
-						log.Printf("WS write: %v", wsErr)
-						break
-					}
-					frameCount++
-					totalBytes += len(frameData)
-					if frameCount%10 == 0 {
-						log.Printf("  streamed %d frames (total=%d bytes)", frameCount, totalBytes)
-					}
-					break
-				}
-
-				// Send complete frame
-				frameData := make([]byte, nextMagic)
-				copy(frameData, accum[:nextMagic])
-				accum = accum[nextMagic:]
-				if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, frameData); wsErr != nil {
-					log.Printf("WS write: %v", wsErr)
-					break
-				}
-				frameCount++
-				totalBytes += len(frameData)
-				if frameCount%10 == 0 {
-					log.Printf("  streamed %d frames (total=%d bytes)", frameCount, totalBytes)
-				}
+			data := buf[:n]
+			if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, data); wsErr != nil {
+				log.Printf("WS write: %v", wsErr)
+				break
+			}
+			frameCount++
+			totalBytes += n
+			if frameCount%100 == 0 {
+				log.Printf("  streamed %d chunks (total=%d bytes)", frameCount, totalBytes)
 			}
 		}
 		if err == io.EOF {
@@ -207,7 +152,7 @@ func main() {
 	}
 
 	cmd.Wait()
-	log.Printf("Stream ended: %d frames, %d bytes", frameCount, totalBytes)
+	log.Printf("Stream ended: %d chunks, %d bytes", frameCount, totalBytes)
 }
 
 func readTokenFromConfig() string {
