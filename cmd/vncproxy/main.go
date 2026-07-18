@@ -1,40 +1,83 @@
-// fbproxy: Framebuffer proxy for reMarkable screen sharing.
-// Runs ON the tablet. Uses the Toltec `restream` binary to capture xochitl's
-// framebuffer from process memory (:mem: mode via ptrace), then pipes the
-// LZ4-compressed stream to rmfakecloud's WebSocket endpoint.
+// vncproxy: VNC proxy for reMarkable native screen share.
+// Runs ON the tablet. Listens for the tablet's UDP broadcast on port 5901,
+// computes the RFB auth challenge, connects to the tablet's RFB server on
+// port 5900 via SSL, completes the RFB handshake, and pipes the raw RFB
+// stream to rmfakecloud's VNCHub via WebSocket for fan-out to web UI viewers.
 //
-// The web UI viewer decompresses the LZ4 frames and renders RGB565 pixels.
+// Protocol reverse-engineered from the rmview project:
+// https://github.com/bordaigorl/rmview
+//
+// Key design decisions (matching rmview behavior):
+//   - Do NOT send SetPixelFormat — use server's default format from ServerInit
+//   - Request HEXTILE, CORRE, ZRLE, RRE, RAW encodings (server picks best)
+//   - Use width/height from ServerInit (not hardcoded)
+//   - E-ink inversion is handled in the viewer (0x0000=white, 0xFFFF=black)
 package main
 
 import (
-	"bufio"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"os/exec"
-	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
-	"crypto/sha256"
-	"golang.org/x/crypto/pbkdf2"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/websocket"
-	"github.com/pierrec/lz4/v4"
+	"golang.org/x/crypto/pbkdf2"
 )
 
+// RFB encoding constants
 const (
-	displayWidth  = 1404
-	displayHeight = 1872
-	frameSize     = displayWidth * displayHeight * 2 // RGB565, 2 bpp
+	RAW_ENCODING       = 0
+	COPYRECT_ENCODING  = 1
+	RRE_ENCODING       = 2
+	CORRE_ENCODING     = 4
+	HEXTILE_ENCODING   = 5
+	ZLIB_ENCODING      = 6
+	ZRLE_ENCODING      = 16
+	PSEUDO_CURSOR      = -239
+	PSEUDO_DESKTOPSIZE = -223
 )
 
 func main() {
+	deviceToken := os.Getenv("DEVICE_TOKEN")
+	if deviceToken == "" {
+		deviceToken = loadDeviceTokenFromXochitl()
+	}
+
+	// Validate/refresh JWT if expired
+	if deviceToken != "" && isJWTExpired(deviceToken) {
+		log.Printf("Device token expired, generating fresh JWT...")
+		newToken, err := generateFreshJWT()
+		if err != nil {
+			log.Printf("JWT generation failed: %v, using expired token", err)
+		} else {
+			deviceToken = newToken
+			log.Printf("Generated fresh JWT")
+		}
+	}
+
+	if deviceToken == "" {
+		log.Fatal("DEVICE_TOKEN required (env, or extractable from xochitl.conf)")
+	}
+
+	// Extract auth0-userid from the JWT
+	userID := os.Getenv("USER_ID")
+	if userID == "" {
+		userID = extractUserID(deviceToken)
+	}
+	if userID == "" {
+		log.Fatal("USER_ID required (env, or extractable from DEVICE_TOKEN JWT auth0-userid field)")
+	}
+
 	serverHost := os.Getenv("SERVER_HOST")
 	if serverHost == "" {
 		serverHost = "172.21.1.1"
@@ -43,311 +86,536 @@ func main() {
 	if serverPort == "" {
 		serverPort = "3000"
 	}
-	restreamBin := os.Getenv("RESTREAM_BIN")
-	if restreamBin == "" {
-		restreamBin = "/opt/bin/restream"
+
+	listenPort := os.Getenv("LISTEN_PORT")
+	if listenPort == "" {
+		listenPort = "5901"
 	}
 
-	deviceToken := os.Getenv("DEVICE_TOKEN")
-	if deviceToken == "" && len(os.Args) > 1 {
-		deviceToken = os.Args[1]
-	}
+	log.Printf("vncproxy starting: userID=%s server=%s:%s listen=:%s", userID, serverHost, serverPort, listenPort)
 
-	// If the token from xochitl.conf is expired, generate a fresh JWT.
-	// The JWT signing key is PBKDF2(rawSecret, "todo some salt", 10000, 32, sha256).
-	secretStr := os.Getenv("JWT_SECRET_KEY")
-	if secretStr == "" {
-		secretStr = "Nevadastate01!" // default for our deployment
+	// Must bind to IPv4 explicitly — Go defaults to IPv6 which doesn't receive IPv4 broadcasts
+	listenAddr := net.IPv4zero.String() + ":" + listenPort
+	addr, err := net.ResolveUDPAddr("udp4", listenAddr)
+	if err != nil {
+		log.Fatalf("resolve udp: %v", err)
 	}
-
-	// Try to use the token from xochitl.conf, but if it's expired, generate a fresh one
-	if deviceToken == "" {
-		deviceToken = readTokenFromConfig()
+	conn, err := net.ListenUDP("udp4", addr)
+	if err != nil {
+		log.Fatalf("listen udp: %v", err)
 	}
+	defer conn.Close()
+	log.Printf("Listening on :%s (IPv4)", listenPort)
 
-	// Check if the token is expired; if so, generate a fresh one
-	if isTokenExpired(deviceToken) && secretStr != "" {
-		log.Printf("Token from config is expired, generating fresh JWT")
-		// Read device info from xochitl.conf
-		deviceID, deviceDesc := readDeviceInfo()
-		freshToken, err := generateJWT(secretStr, deviceID, deviceDesc)
+	buf := make([]byte, 256)
+	connected := false
+	var mu sync.Mutex
+
+	for {
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("Failed to generate JWT: %v", err)
-		} else {
-			deviceToken = freshToken
-			log.Printf("Generated fresh JWT (len=%d)", len(freshToken))
+			log.Printf("udp read: %v", err)
+			continue
+		}
+		if n < 12 {
+			continue
+		}
+
+		mu.Lock()
+		if connected {
+			mu.Unlock()
+			continue // already connected, skip repeated broadcasts
+		}
+		mu.Unlock()
+
+		log.Printf("Broadcast %d bytes from %s", n, remoteAddr)
+
+		timestamp := buf[0:8]
+		hashLen := binary.BigEndian.Uint32(buf[8:12])
+		if 12+int(hashLen) > n {
+			continue
+		}
+
+		// Parse RFB server address from broadcast
+		addrOffset := 12 + int(hashLen)
+		rfbHost := "127.0.0.1"
+		rfbPort := uint16(5900)
+		if addrOffset+7 <= n && buf[addrOffset] == 0x00 {
+			addrOffset++
+			rfbHost = net.IP(buf[addrOffset : addrOffset+4]).String()
+			rfbPort = binary.BigEndian.Uint16(buf[addrOffset+4 : addrOffset+6])
+		}
+		log.Printf("RFB server at %s:%d", rfbHost, rfbPort)
+
+		// Compute challenge: SHA256(timestamp + SHA256(userId))
+		userIDHash := sha256.Sum256([]byte(userID))
+		challengeInput := append(timestamp, userIDHash[:]...)
+		challenge := sha256.Sum256(challengeInput)
+
+		// Connect to RFB server via SSL
+		rfbAddr := fmt.Sprintf("%s:%d", rfbHost, rfbPort)
+		tlsConn, err := tls.Dial("tcp", rfbAddr, &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			log.Printf("RFB connect: %v", err)
+			continue
+		}
+
+		// RFB handshake
+		serverInfo, err := rfbHandshake(tlsConn, challenge[:])
+		if err != nil {
+			log.Printf("RFB handshake: %v", err)
+			tlsConn.Close()
+			continue
+		}
+		log.Printf("RFB handshake OK! FB: %dx%d, bpp=%d, depth=%d, name=%q",
+			serverInfo.width, serverInfo.height, serverInfo.bpp, serverInfo.depth, serverInfo.name)
+
+		mu.Lock()
+		connected = true
+		mu.Unlock()
+
+		// Send SetEncodings + FramebufferUpdateRequest, then pipe to server
+		go pipeRFBStream(tlsConn, serverHost, serverPort, deviceToken, serverInfo)
+	}
+}
+
+// serverInitInfo holds parsed ServerInit data
+type serverInitInfo struct {
+	width      uint16
+	height     uint16
+	bpp        uint8
+	depth      uint8
+	bigEndian  uint8
+	trueColor  uint8
+	redMax     uint16
+	greenMax   uint16
+	blueMax    uint16
+	redShift   uint8
+	greenShift uint8
+	blueShift  uint8
+	name       string
+}
+
+func rfbHandshake(conn *tls.Conn, challenge []byte) (*serverInitInfo, error) {
+	// Read server version (12 bytes)
+	version := make([]byte, 12)
+	if _, err := io.ReadFull(conn, version); err != nil {
+		return nil, fmt.Errorf("read version: %w", err)
+	}
+	log.Printf("  Server: %s", strings.TrimSpace(string(version)))
+
+	// Echo version back (reMarkable uses "reM 001.001\n")
+	if _, err := conn.Write(version); err != nil {
+		return nil, fmt.Errorf("send version: %w", err)
+	}
+
+	// Read number of security types
+	numTypesBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, numTypesBuf); err != nil {
+		return nil, fmt.Errorf("read num sec types: %w", err)
+	}
+	numTypes := int(numTypesBuf[0])
+	if numTypes == 0 {
+		reasonLenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, reasonLenBuf); err == nil {
+			reasonLen := binary.BigEndian.Uint32(reasonLenBuf)
+			if reasonLen > 0 && reasonLen < 256 {
+				reason := make([]byte, reasonLen)
+				io.ReadFull(conn, reason)
+				return nil, fmt.Errorf("rejected: %s", string(reason))
+			}
+		}
+		return nil, fmt.Errorf("no security types")
+	}
+
+	secTypes := make([]byte, numTypes)
+	if _, err := io.ReadFull(conn, secTypes); err != nil {
+		return nil, fmt.Errorf("read sec types: %w", err)
+	}
+	log.Printf("  Sec types: %v", secTypes)
+
+	// Select RM_AUTH (100) or NO_AUTH (1)
+	useRMAuth := false
+	for _, t := range secTypes {
+		if t == 100 {
+			useRMAuth = true
+			break
 		}
 	}
 
-	if deviceToken == "" {
-		log.Fatal("no device token provided (set DEVICE_TOKEN or pass as arg)")
+	if useRMAuth {
+		conn.Write([]byte{100})
+
+		// Server sends 4 bytes (challenge prompt/nonce) — MUST read before sending our challenge
+		serverPrompt := make([]byte, 4)
+		if _, err := io.ReadFull(conn, serverPrompt); err != nil {
+			return nil, fmt.Errorf("read RM_AUTH prompt: %w", err)
+		}
+		log.Printf("  RM_AUTH server prompt: %x", serverPrompt)
+
+		// Send challenge length (4 bytes) + challenge (32 bytes)
+		lenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(lenBuf, uint32(len(challenge)))
+		conn.Write(lenBuf)
+		conn.Write(challenge)
+		log.Printf("  Sent RM_AUTH challenge")
+
+		// Read auth result (1 byte)
+		result := make([]byte, 1)
+		if _, err := io.ReadFull(conn, result); err != nil {
+			return nil, fmt.Errorf("read auth result: %w", err)
+		}
+		if result[0] != 0 {
+			return nil, fmt.Errorf("auth failed (result=%d)", result[0])
+		}
+		log.Printf("  Auth OK!")
+	} else {
+		// Try NO_AUTH
+		hasNoAuth := false
+		for _, t := range secTypes {
+			if t == 1 {
+				hasNoAuth = true
+				break
+			}
+		}
+		if !hasNoAuth {
+			return nil, fmt.Errorf("no supported auth type: %v", secTypes)
+		}
+		conn.Write([]byte{1})
+		result := make([]byte, 4)
+		io.ReadFull(conn, result)
+		if binary.BigEndian.Uint32(result) != 0 {
+			return nil, fmt.Errorf("auth failed")
+		}
 	}
 
-	log.Printf("fbproxy starting: server=%s:%s restream=%s", serverHost, serverPort, restreamBin)
+	// Send ClientInit (shared=1)
+	conn.Write([]byte{1})
+
+	// Read ServerInit (24 bytes) with timeout
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	header := make([]byte, 24)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, fmt.Errorf("read serverinit: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{}) // reset deadline
+
+	info := &serverInitInfo{
+		width:      binary.BigEndian.Uint16(header[0:2]),
+		height:     binary.BigEndian.Uint16(header[2:4]),
+		bpp:        header[4],
+		depth:      header[5],
+		bigEndian:  header[6],
+		trueColor:  header[7],
+		redMax:     binary.BigEndian.Uint16(header[8:10]),
+		greenMax:   binary.BigEndian.Uint16(header[10:12]),
+		blueMax:    binary.BigEndian.Uint16(header[12:14]),
+		redShift:   header[14],
+		greenShift: header[15],
+		blueShift:  header[16],
+	}
+	nameLen := binary.BigEndian.Uint32(header[20:24])
+	log.Printf("  ServerInit raw: %x", header)
+	log.Printf("  FB: %dx%d, bpp=%d, depth=%d, trueColor=%d, R/G/B max=%d/%d/%d, R/G/B shift=%d/%d/%d",
+		info.width, info.height, info.bpp, info.depth, info.trueColor,
+		info.redMax, info.greenMax, info.blueMax,
+		info.redShift, info.greenShift, info.blueShift)
+
+	// Read server name if present
+	if nameLen > 0 && nameLen < 1024 {
+		name := make([]byte, nameLen)
+		io.ReadFull(conn, name)
+		info.name = string(name)
+		log.Printf("  Name: %s", info.name)
+	} else if nameLen == 0 {
+		log.Printf("  No name in ServerInit")
+	} else {
+		log.Printf("  Suspicious nameLen=%d, skipping", nameLen)
+	}
+
+	log.Printf("  Handshake complete, starting stream...")
+	return info, nil
+}
+
+func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string, info *serverInitInfo) {
+	defer rfbConn.Close()
+	log.Printf("pipeRFBStream: starting, server=%s:%s, FB=%dx%d bpp=%d",
+		serverHost, serverPort, info.width, info.height, info.bpp)
+
+	// Do NOT send SetPixelFormat — use server's default format (like rmview).
+	// The reMarkable server sends a valid pixel format in ServerInit.
+	// Forcing RGB565 was likely the cause of the "all-zeros" issue.
+
+	// Send SetEncodings: message-type=2, padding=0, count=N, encodings
+	// Request multiple encodings like rmview — server picks the best one.
+	encodings := []int32{
+		HEXTILE_ENCODING,
+		CORRE_ENCODING,
+		ZRLE_ENCODING,
+		RRE_ENCODING,
+		RAW_ENCODING,
+		PSEUDO_DESKTOPSIZE,
+		PSEUDO_CURSOR,
+	}
+	setEnc := make([]byte, 4+len(encodings)*4)
+	setEnc[0] = 2 // SetEncodings
+	setEnc[1] = 0 // padding
+	binary.BigEndian.PutUint16(setEnc[2:4], uint16(len(encodings)))
+	for i, enc := range encodings {
+		binary.BigEndian.PutUint32(setEnc[4+i*4:8+i*4], uint32(enc))
+	}
+	if _, err := rfbConn.Write(setEnc); err != nil {
+		log.Printf("SetEncodings: %v", err)
+		return
+	}
+	log.Printf("Sent SetEncodings: %v", encodings)
+
+	// Send FramebufferUpdateRequest: request full screen.
+	// Use server's dimensions from ServerInit. If ServerInit returned 0x0
+	// (which can happen), fall back to known reMarkable dimensions.
+	w := info.width
+	h := info.height
+	if w == 0 || h == 0 {
+		log.Printf("ServerInit returned 0x0 dimensions, using default 1404x1872")
+		w = 1404
+		h = 1872
+	}
+	fbReq := make([]byte, 10)
+	fbReq[0] = 3 // FramebufferUpdateRequest
+	fbReq[1] = 0 // non-incremental (full update)
+	binary.BigEndian.PutUint16(fbReq[2:4], 0) // x
+	binary.BigEndian.PutUint16(fbReq[4:6], 0) // y
+	binary.BigEndian.PutUint16(fbReq[6:8], w)
+	binary.BigEndian.PutUint16(fbReq[8:10], h)
+	if _, err := rfbConn.Write(fbReq); err != nil {
+		log.Printf("FBUpdateRequest: %v", err)
+		return
+	}
+	log.Printf("Sent FramebufferUpdateRequest: %dx%d", w, h)
 
 	// Connect to rmfakecloud via WebSocket
-	wsURL := "ws://" + net.JoinHostPort(serverHost, serverPort) + "/ui/api/screenshare/vnc/connect?token=" + deviceToken
+	wsURL := fmt.Sprintf("ws://%s:%s/ui/api/screenshare/vnc/connect?token=%s", serverHost, serverPort, deviceToken)
 	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		log.Fatalf("WS connect: %v", err)
+		log.Printf("WS connect to %s: %v", wsURL, err)
+		return
 	}
 	defer wsConn.Close()
 	log.Printf("WS connected to %s", wsURL)
 
-	// Send metadata as binary (not text) so VNCHub forwards it
-	// Actually, don't send meta at all — the viewer knows the format.
-	// The VNCHub only forwards BinaryMessage, so text meta would be dropped anyway.
-
-	// Start restream as subprocess
-	// reMarkable 2 firmware 3.3.2: 1bpp gray8, 1872×1404 (landscape), LZ4 compressed
-	// The 4bpp mode fails (anonymous mapping after fb0 is only 8MB, not enough for 10.5MB frame)
-	// The 2bpp mode produces tiled output (bytes are duplicated — correlation 1.0 between high/low)
-	// 1bpp with skip=8 produces clean frames. Use restream v1.5.0 (has -s flag).
-	//
-	// IMPORTANT: restream outputs LZ4 frames (magic 04 22 4D 18) when writing to a file/FIFO,
-	// but raw data WITHOUT framing when writing to a pipe (stdout pipe). To get LZ4 frames,
-	// we redirect restream's stdout to a named pipe (FIFO) and read from it.
-	fifoPath := "/tmp/restream_fifo"
-	os.Remove(fifoPath)
-	if err := syscall.Mkfifo(fifoPath, 0644); err != nil {
-		log.Fatalf("create FIFO: %v", err)
+	// Send pixel format info to the viewer via VNCHub (as first binary message).
+	// This tells the viewer the bpp, dimensions, and color masks from ServerInit.
+	// Format: 4-byte magic "RFBF" + width(2) + height(2) + bpp(1) + depth(1) +
+	//          bigEndian(1) + trueColor(1) + redMax(2) + greenMax(2) + blueMax(2) +
+	//          redShift(1) + greenShift(1) + blueShift(1) + reserved(1) = 24 bytes
+	meta := make([]byte, 24)
+	meta[0] = 'R'
+	meta[1] = 'F'
+	meta[2] = 'B'
+	meta[3] = 'F'
+	binary.BigEndian.PutUint16(meta[4:6], w)
+	binary.BigEndian.PutUint16(meta[6:8], h)
+	meta[8] = info.bpp
+	meta[9] = info.depth
+	meta[10] = info.bigEndian
+	meta[11] = info.trueColor
+	binary.BigEndian.PutUint16(meta[12:14], info.redMax)
+	binary.BigEndian.PutUint16(meta[14:16], info.greenMax)
+	binary.BigEndian.PutUint16(meta[16:18], info.blueMax)
+	meta[18] = info.redShift
+	meta[19] = info.greenShift
+	meta[20] = info.blueShift
+	// meta[21:24] reserved = 0
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, meta); err != nil {
+		log.Printf("WS meta send: %v", err)
+		return
 	}
-	defer os.Remove(fifoPath)
+	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
+		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
+		info.redShift, info.greenShift, info.blueShift)
 
-	cmd := exec.Command(restreamBin, "-w", "1872", "-h", "1404", "-b", "1", "-s", "8", "-f", ":mem:")
-	cmd.Env = []string{"PATH=/opt/bin:/usr/bin:/bin"}
+	done := make(chan struct{}, 2)
+	totalBytes := 0
 
-	// Open the FIFO. On Linux, O_RDONLY blocks until O_WRONLY opens and vice versa,
-	// so we open both in goroutines. Must use O_WRONLY (not O_RDWR) so restream
-	// detects a proper FIFO and outputs LZ4 frames.
-	type fifoResult struct {
-		f   *os.File
-		err error
-	}
-	writeCh := make(chan fifoResult, 1)
-	readCh := make(chan fifoResult, 1)
+	// Also save raw RFB data to file for offline analysis
+	rawFile, _ := os.Create("/tmp/rfb_raw.bin")
+	defer rawFile.Close()
+
+	// RFB -> WebSocket (binary messages)
 	go func() {
-		fw, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
-		writeCh <- fifoResult{fw, err}
-	}()
-	go func() {
-		fr, err := os.Open(fifoPath)
-		readCh <- fifoResult{fr, err}
-	}()
-
-	wr := <-writeCh
-	if wr.err != nil {
-		log.Fatalf("open FIFO for writing: %v", wr.err)
-	}
-	defer wr.f.Close()
-	cmd.Stdout = wr.f
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		log.Fatalf("restream stderr pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("start restream: %v", err)
-	}
-	log.Printf("restream started (pid=%d)", cmd.Process.Pid)
-
-	// Log restream stderr
-	go func() {
-		r := bufio.NewReader(stderr)
+		buf := make([]byte, 65536)
 		for {
-			line, err := r.ReadString('\n')
+			n, err := rfbConn.Read(buf)
 			if err != nil {
+				log.Printf("RFB read ended: %v (total=%d bytes)", err, totalBytes)
+				done <- struct{}{}
 				return
 			}
-			log.Printf("[restream] %s", strings.TrimSpace(line))
+			totalBytes += n
+			if rawFile != nil {
+				rawFile.Write(buf[:n])
+			}
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				log.Printf("WS write ended: %v", err)
+				done <- struct{}{}
+				return
+			}
+			if totalBytes < 5000 || totalBytes%100000 < 65536 {
+				nonZero := 0
+				for i := 0; i < n; i++ {
+					if buf[i] != 0 {
+						nonZero++
+					}
+				}
+				log.Printf("  RFB->WS: %d bytes (total=%d), nonZero=%d, first: %x", n, totalBytes, nonZero, buf[:min(n, 16)])
+			}
+			// After each read, request incremental update for next frame
+			fbReq[1] = 1 // incremental
+			rfbConn.Write(fbReq)
 		}
 	}()
 
-	// Tail the restream output file and forward data via WebSocket.
-	// restream writes LZ4 frames (with magic 04 22 4D 18) to the file.
-	// We forward chunks; the viewer reassembles LZ4 frames.
-	// Read LZ4-compressed data from the FIFO, decompress, send raw pixel frames.
-	// restream writes ONE continuous LZ4 frame. We use lz4 streaming decompression
-	// to read it, and send complete raw frames (2,628,288 bytes each) over WebSocket.
-	// The viewer renders raw pixels directly — no LZ4 decompression in browser.
-	FRAME_SIZE := 1872 * 1404 // 2,628,288 bytes (1 byte per pixel, 4-bit grayscale)
-
-	// Wait for the read end of the FIFO to open
-	rr := <-readCh
-	if rr.err != nil {
-		log.Fatalf("open FIFO for reading: %v", rr.err)
-	}
-	defer rr.f.Close()
-
-	// Create LZ4 streaming reader over the FIFO
-	lz4Reader := lz4.NewReader(rr.f)
-
-	// Read complete frames and send them
-	frameBuf := make([]byte, FRAME_SIZE)
-	frameCount := 0
-	for {
-		_, err := io.ReadFull(lz4Reader, frameBuf)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			log.Printf("LZ4 stream ended after %d frames", frameCount)
-			break
+	// WebSocket -> RFB (for input events from web UI)
+	go func() {
+		for {
+			_, data, err := wsConn.ReadMessage()
+			if err != nil {
+				done <- struct{}{}
+				return
+			}
+			if _, err := rfbConn.Write(data); err != nil {
+				done <- struct{}{}
+				return
+			}
 		}
-		if err != nil {
-			log.Printf("LZ4 read: %v", err)
-			break
-		}
+	}()
 
-		// Send raw pixel frame
-		if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, frameBuf); wsErr != nil {
-			log.Printf("WS write: %v", wsErr)
-			break
-		}
-		frameCount++
-		if frameCount%10 == 0 {
-			log.Printf("  sent %d frames", frameCount)
-		}
-	}
-
-	cmd.Wait()
-	log.Printf("Stream ended: %d frames", frameCount)
+	<-done
+	log.Printf("Stream ended (total=%d bytes)", totalBytes)
 }
 
-func readTokenFromConfig() string {
-	paths := []string{
-		"/home/root/.config/remarkable/xochitl.conf",
-		"/home/root/.xochitl.conf",
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "UserToken") {
-				// Format: UserToken=@ByteArray(eyJ...)
-				start := strings.Index(line, "@ByteArray(")
-				if start >= 0 {
-					token := line[start+11:]
-					end := strings.Index(token, ")")
-					if end >= 0 {
-						token = token[:end]
-					}
-					if len(token) > 20 {
-						log.Printf("Read token from %s (len=%d)", path, len(token))
-						return token
-					}
-				}
-				// Try without @ByteArray wrapper
-				parts := strings.SplitN(line, "=", 2)
-				if len(parts) == 2 {
-					token := strings.TrimSpace(parts[1])
-					token = strings.Trim(token, "@ByteArray()")
-					if len(token) > 20 {
-						return token
-					}
-				}
+	return b
+}
+
+// extractUserID extracts auth0-userid from a JWT token
+func extractUserID(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload := parts[1]
+	// Add padding
+	for len(payload)%4 != 0 {
+		payload += "="
+	}
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return ""
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(data, &claims); err != nil {
+		return ""
+	}
+	if uid, ok := claims["auth0-userid"].(string); ok {
+		return uid
+	}
+	return ""
+}
+
+// isJWTExpired checks if a JWT's exp claim is in the past
+func isJWTExpired(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false // can't parse, assume valid
+	}
+	payload := parts[1]
+	for len(payload)%4 != 0 {
+		payload += "="
+	}
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return false
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(data, &claims); err != nil {
+		return false
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return false
+	}
+	return time.Now().Unix() > int64(exp)
+}
+
+// loadDeviceTokenFromXochitl reads the UserToken from xochitl.conf
+func loadDeviceTokenFromXochitl() string {
+	data, err := os.ReadFile("/home/root/.config/remarkable/xochitl.conf")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "UserToken=") {
+			val := strings.TrimPrefix(line, "UserToken=")
+			val = strings.Trim(val, `"`)
+			// xochitl.conf uses @ByteArray(...) wrapper
+			val = strings.TrimPrefix(val, "@ByteArray(")
+			val = strings.TrimSuffix(val, ")")
+			if len(val) > 50 {
+				return val
 			}
 		}
 	}
 	return ""
 }
 
-// isTokenExpired checks if a JWT token's exp claim is in the past.
-func isTokenExpired(token string) bool {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return true
+// generateFreshJWT creates a new device JWT using the PBKDF2-derived signing key.
+// This mirrors rmfakecloud's token generation so the server accepts it.
+func generateFreshJWT() (string, error) {
+	secretKey := os.Getenv("JWT_SECRET_KEY")
+	if secretKey == "" {
+		secretKey = "Nevadastate01!"
 	}
-	// Decode the payload (base64url, no padding)
-	payload := parts[1]
-	// Add padding if needed
-	for len(payload)%4 != 0 {
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return true
-	}
-	// Parse JSON to get exp
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return true
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return true
-	}
-	return time.Now().Unix() > int64(exp)
-}
 
-// readDeviceInfo reads the device ID and description from xochitl.conf
-func readDeviceInfo() (string, string) {
-	paths := []string{
-		"/home/root/.config/remarkable/xochitl.conf",
-		"/home/root/.xochitl.conf",
-	}
-	deviceID := ""
-	deviceDesc := "remarkable"
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.Contains(line, "DeviceID=") || strings.Contains(line, "device-id=") {
-				parts := strings.SplitN(line, "=", 2)
-				if len(parts) == 2 {
-					deviceID = strings.Trim(strings.TrimSpace(parts[1]), "@ByteArray()")
-				}
-			}
-		}
-	}
-	if deviceID == "" {
-		deviceID = "RM110-219-91826"
-	}
-	return deviceID, deviceDesc
-}
+	// Derive signing key: PBKDF2(secretKey, "todo some salt", 10000, SHA256, 32 bytes)
+	derivedKey := pbkdf2.Key([]byte(secretKey), []byte("todo some salt"), 10000, 32, sha256.New)
 
-// generateJWT creates a fresh JWT for device authentication
-func generateJWT(secret, deviceID, deviceDesc string) (string, error) {
-	// Derive signing key using PBKDF2 (same as rmfakecloud)
-	dk := pbkdf2.Key([]byte(secret), []byte("todo some salt"), 10000, 32, sha256.New)
-
-	// Create claims matching the device token format
-	now := time.Now()
+	// Build claims matching what rmfakecloud generates for devices
+	now := time.Now().Unix()
 	claims := jwt.MapClaims{
-		"auth0-user-id": "ypyly",
+		"auth0-userid": "ypyly",
 		"auth0-profile": map[string]interface{}{
-			"UserID":      "ypyly",
-			"IsSocial":    false,
-			"Connection":  "Username-Password-Authentication",
-			"Name":        "ypyly",
-			"Nickname":    "",
-			"GivenName":   "",
-			"FamilyName":  "",
-			"Email":       "ypyly (via https://local.appspot.com)",
-			"EmailVerified": true,
-			"CreatedAt":   "2025-03-29T10:59:55.715945208Z",
-			"UpdatedAt":   "2025-03-29T10:59:55.715945298Z",
+			"UserID":          "ypyly",
+			"IsSocial":        false,
+			"Connection":      "Username-Password-Authentication",
+			"Name":            "ypyly",
+			"Nickname":        "",
+			"GivenName":       "",
+			"FamilyName":      "",
+			"Email":           "ypyly (via https://local.appspot.com)",
+			"EmailVerified":   true,
+			"CreatedAt":       "2025-03-29T10:59:55.715945208Z",
+			"UpdatedAt":       "2025-03-29T10:59:55.715945298Z",
 		},
-		"device-desc":  deviceDesc,
-		"device-id":    deviceID,
-		"scopes":       "intgr screenshare docedit sync:tortoises",
+		"device-desc": "remarkable",
+		"device-id":    "RM110-219-91826",
+		"scopes":       "intgr screenshare doedit sync:tortoisedb",
 		"version":      10,
 		"level":        "connect",
-		"telectonic":   "eu",
-		"exp":          now.Add(24 * time.Hour).Unix(),
-		"jti":          fmt.Sprintf("%d", now.UnixNano()),
-		"iat":          now.Unix(),
+		"tectonic":     "eu",
+		"exp":          now + 86400, // 24 hours
+		"jti":          fmt.Sprintf("ck%010d", now),
+		"iat":          now,
 		"iss":          "rM WebApp",
-		"nbf":          now.Add(-5 * time.Minute).Unix(), // skew tolerance
+		"nbf":          now - 300, // -5min skew for clock drift
 		"sub":          "ypyly",
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	token.Header["kid"] = "1"
-	return token.SignedString(dk)
+	return token.SignedString(derivedKey)
 }
-
-// Unused but kept for reference
-var _ = strconv.Itoa

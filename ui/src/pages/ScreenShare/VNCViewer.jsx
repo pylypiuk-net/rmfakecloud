@@ -1,184 +1,653 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import pako from 'pako';
 
 const ROOT_URL = '/ui/api';
 
-// Framebuffer viewer for reMarkable screen sharing.
-// Data path: restream (-w 1872 -h 1404 -b 1 -s 8 -f :mem:) → LZ4 frame →
-//   fbproxy (decompresses LZ4) → raw pixels → WebSocket → rmfakecloud VNCHub → browser
+// RFB stream viewer for reMarkable native screen share.
+// The proxy captures the tablet's VNC broadcast, does the RFB handshake,
+// and pipes the raw RFB byte stream to this viewer via the VNCHub.
 //
-// The proxy decompresses LZ4 and sends complete raw frames (2,628,288 bytes each).
-// The viewer renders raw 4-bit grayscale pixels directly — no LZ4 decompression needed.
-//
-// Pixel format: 4-bit grayscale (0-15), 1872 wide × 1404 tall (landscape)
-// Rendering: scale 0-15 → 0-255 (×17), rotate 90° CCW → portrait (1404×1872)
-// 15 = white (e-ink background), 0 = black (ink) — no inversion needed.
-
-const FB_WIDTH = 1872;
-const FB_HEIGHT = 1404;
-const FRAME_SIZE = FB_WIDTH * FB_HEIGHT; // 2,628,288 bytes (1 byte per pixel)
-
-export default function VNCViewer({ token, onDisconnect }) {
+// Key design decisions:
+//   - First WebSocket message is an "RFBF" meta header with pixel format from ServerInit
+//   - E-ink inversion: 0x0000 = white (no ink), 0xFFFF = black (full ink)
+//   - Supports RAW and HEXTILE encodings (server picks one)
+//   - Buffers across WebSocket messages (RFB is a byte stream, WS is message-based)
+export default function VNCViewer() {
   const canvasRef = useRef(null);
   const wsRef = useRef(null);
-  const bufferRef = useRef(new Uint8Array(0));
-  const [status, setStatus] = useState('idle');
-  const [frameCount, setFrameCount] = useState(0);
-  const [fps, setFps] = useState(0);
-  const [bufSize, setBufSize] = useState(0);
-  const frameTimesRef = useRef([]);
+  const streamBufRef = useRef(null);
+  const parseStateRef = useRef(null);
+  const [status, setStatus] = useState('disconnected');
+  const [error, setError] = useState(null);
+  const [stats, setStats] = useState({ frames: 0, bytes: 0 });
 
-  const renderFrame = useCallback((frameData) => {
-    const canvas = canvasRef.current;
-    if (!canvas || frameData.length < FRAME_SIZE) return;
-
-    // Portrait dimensions after 90° CCW rotation
-    canvas.width = FB_HEIGHT;  // 1404
-    canvas.height = FB_WIDTH;  // 1872
-
-    const ctx = canvas.getContext('2d');
-    const imageData = ctx.createImageData(canvas.width, canvas.height);
-    const pixels = imageData.data;
-
-    // Source: 1872 wide × 1404 tall, 1 byte per pixel, 4-bit grayscale (0-15)
-    // Rotate 90° CCW: dst[px][py] = src[py][FB_WIDTH-1-px]
-    // For 90° CCW: dst pixel at (px, py) in portrait (1404×1872):
-    //   src_x = py                 (0..1871)
-    //   src_y = FB_HEIGHT-1 - px   (0..1403)
-
-    for (let py = 0; py < canvas.height; py++) {
-      for (let px = 0; px < canvas.width; px++) {
-        const srcX = py;
-        const srcY = FB_HEIGHT - 1 - px;
-        const srcIdx = srcY * FB_WIDTH + srcX;
-        // Scale 4-bit (0-15) to 8-bit (0-255): multiply by 17
-        const val = frameData[srcIdx] * 17;
-        const dstIdx = (py * canvas.width + px) * 4;
-        pixels[dstIdx] = val;     // R
-        pixels[dstIdx + 1] = val; // G
-        pixels[dstIdx + 2] = val; // B
-        pixels[dstIdx + 3] = 255; // A
-      }
-    }
-
-    ctx.putImageData(imageData, 0, 0);
-
-    // Track FPS
-    const now = performance.now();
-    frameTimesRef.current.push(now);
-    if (frameTimesRef.current.length > 30) {
-      frameTimesRef.current.shift();
-    }
-    if (frameTimesRef.current.length >= 2) {
-      const elapsed = frameTimesRef.current[frameTimesRef.current.length - 1] - frameTimesRef.current[0];
-      setFps((frameTimesRef.current.length / elapsed * 1000).toFixed(1));
-    }
-    setFrameCount(c => c + 1);
+  const initParser = useCallback(() => {
+    streamBufRef.current = new Uint8Array(0);
+    parseStateRef.current = {
+      width: 1404,
+      height: 1872,
+      bpp: 32,       // will be set from RFBF meta
+      bytesPerPixel: 4,
+      bigEndian: 0,
+      redMax: 255,
+      greenMax: 255,
+      blueMax: 255,
+      redShift: 0,
+      greenShift: 8,
+      blueShift: 16,
+      gotMeta: false,
+      phase: 'meta', // start expecting RFBF meta
+    };
   }, []);
 
-  const connect = useCallback(() => {
-    if (wsRef.current) return;
-    setStatus('connecting');
-    bufferRef.current = new Uint8Array(0);
-    setFrameCount(0);
-    setFps(0);
+  const appendData = useCallback((newData) => {
+    const old = streamBufRef.current;
+    const combined = new Uint8Array(old.length + newData.length);
+    combined.set(old);
+    combined.set(newData, old.length);
+    streamBufRef.current = combined;
+  }, []);
 
-    const wsURL = `${ROOT_URL.replace(/^http/, 'ws')}/screenshare/vnc/stream?token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(wsURL);
-    ws.binaryType = 'arraybuffer';
-    wsRef.current = ws;
+  const consume = useCallback((n) => {
+    streamBufRef.current = streamBufRef.current.slice(n);
+  }, []);
 
-    ws.onopen = () => setStatus('connected');
+  // Convert a pixel value to RGBA.
+  // Native VNC server sends standard RGB (0=black, max=white).
+  // No e-ink inversion needed — the VNC server already provides correct colors.
+  const pixelToRGBA = useCallback((pixel, state) => {
+    const r = (pixel >> state.redShift) & state.redMax;
+    const g = (pixel >> state.greenShift) & state.greenMax;
+    const b = (pixel >> state.blueShift) & state.blueMax;
 
-    ws.onmessage = (event) => {
-      const data = new Uint8Array(event.data);
+    // Expand to 8-bit
+    const r8 = Math.round((r / state.redMax) * 255);
+    const g8 = Math.round((g / state.greenMax) * 255);
+    const b8 = Math.round((b / state.blueMax) * 255);
 
-      // Each WebSocket message is a complete raw frame (FRAME_SIZE bytes)
-      if (data.length >= FRAME_SIZE) {
-        renderFrame(data);
+    return [r8, g8, b8, 255];
+  }, []);
+
+  // Render a RAW rectangle to canvas
+  const renderRAW = useCallback((x, y, w, h, pixelData, state) => {
+    const container = canvasRef.current;
+    if (!container) return;
+    const canvas = container.querySelector('canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    const numPixels = w * h;
+    const imgData = ctx.createImageData(w, h);
+    const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
+    const bypp = state.bytesPerPixel;
+
+    for (let i = 0; i < numPixels; i++) {
+      const offset = i * bypp;
+      if (offset + bypp > view.byteLength) break;
+
+      let pixel;
+      if (bypp === 4) {
+        pixel = view.getUint32(offset, state.bigEndian === 0);
+      } else if (bypp === 2) {
+        pixel = view.getUint16(offset, state.bigEndian === 0);
+      } else if (bypp === 1) {
+        pixel = view.getUint8(offset);
+      } else {
+        pixel = view.getUint16(offset, state.bigEndian === 0);
       }
+
+      const [r, g, b, a] = pixelToRGBA(pixel, state);
+      imgData.data[i * 4] = r;
+      imgData.data[i * 4 + 1] = g;
+      imgData.data[i * 4 + 2] = b;
+      imgData.data[i * 4 + 3] = a;
+    }
+
+    ctx.putImageData(imgData, x, y);
+  }, [pixelToRGBA]);
+
+  // Render a HEXTILE rectangle (encoding 5)
+  // HEXTILE divides the rect into 16x16 tiles, each tile has a subencoding mask.
+  const renderHEXTILE = useCallback((x, y, w, h, pixelData, state) => {
+    const container = canvasRef.current;
+    if (!container) return;
+    const canvas = container.querySelector('canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
+    const bypp = state.bytesPerPixel;
+    let offset = 0;
+
+    // Read background and foreground colors (persist across tiles)
+    let bgPixel = 0;
+    let fgPixel = 0;
+
+    for (let ty = 0; ty < h; ty += 16) {
+      for (let tx = 0; tx < w; tx += 16) {
+        if (offset + 1 > view.byteLength) return;
+
+        const subencoding = view.getUint8(offset);
+        offset++;
+
+        const tw = Math.min(16, w - tx);
+        const th = Math.min(16, h - ty);
+        const tilePixels = tw * th;
+
+        // Read background color if specified
+        if (subencoding & 2) {
+          if (offset + bypp > view.byteLength) return;
+          if (bypp === 4) bgPixel = view.getUint32(offset, state.bigEndian === 0);
+          else if (bypp === 2) bgPixel = view.getUint16(offset, state.bigEndian === 0);
+          else bgPixel = view.getUint8(offset);
+          offset += bypp;
+        }
+
+        // Read foreground color if specified
+        if (subencoding & 4) {
+          if (offset + bypp > view.byteLength) return;
+          if (bypp === 4) fgPixel = view.getUint32(offset, state.bigEndian === 0);
+          else if (bypp === 2) fgPixel = view.getUint16(offset, state.bigEndian === 0);
+          else fgPixel = view.getUint8(offset);
+          offset += bypp;
+        }
+
+        if (subencoding & 1) {
+          // RAW tile: read tw*th pixels
+          const tileBytes = tilePixels * bypp;
+          if (offset + tileBytes > view.byteLength) return;
+          const tileData = pixelData.slice(offset, offset + tileBytes);
+          renderRAW(x + tx, y + ty, tw, th, tileData, state);
+          offset += tileBytes;
+        } else {
+          // Subrect-encoded tile
+          const numSubrects = (subencoding & 8) ? view.getUint8(offset) : 0;
+          if (subencoding & 8) offset++;
+
+          // Fill tile with background
+          const [br, bg, bb, ba] = pixelToRGBA(bgPixel, state);
+          const tileImg = ctx.createImageData(tw, th);
+          for (let i = 0; i < tilePixels; i++) {
+            tileImg.data[i * 4] = br;
+            tileImg.data[i * 4 + 1] = bg;
+            tileImg.data[i * 4 + 2] = bb;
+            tileImg.data[i * 4 + 3] = ba;
+          }
+
+          // Draw subrects
+          for (let s = 0; s < numSubrects; s++) {
+            if (subencoding & 16) {
+              // Colored subrect: read color
+              if (offset + bypp > view.byteLength) return;
+              if (bypp === 4) fgPixel = view.getUint32(offset, state.bigEndian === 0);
+              else if (bypp === 2) fgPixel = view.getUint16(offset, state.bigEndian === 0);
+              else fgPixel = view.getUint8(offset);
+              offset += bypp;
+            }
+            if (offset + 2 > view.byteLength) return;
+            const sx = (view.getUint8(offset) >> 4) & 0xf;
+            const sy = view.getUint8(offset) & 0xf;
+            offset++;
+            const sw = ((view.getUint8(offset) >> 4) & 0xf) + 1;
+            const sh = (view.getUint8(offset) & 0xf) + 1;
+            offset++;
+
+            const [sr, sg, sb, sa] = pixelToRGBA(fgPixel, state);
+            for (let r = sy; r < sy + sh && r < th; r++) {
+              for (let c = sx; c < sx + sw && c < tw; c++) {
+                const idx = (r * tw + c) * 4;
+                tileImg.data[idx] = sr;
+                tileImg.data[idx + 1] = sg;
+                tileImg.data[idx + 2] = sb;
+                tileImg.data[idx + 3] = sa;
+              }
+            }
+          }
+
+          ctx.putImageData(tileImg, x + tx, y + ty);
+        }
+      }
+    }
+  }, [pixelToRGBA, renderRAW]);
+
+  // Render a ZRLE rectangle (encoding 16).
+  // ZRLE: 4-byte zlib length + zlib-compressed data.
+  // Decompressed data = 64x64 tiles, each with a subencoding byte.
+  // Subencoding:
+  //   0 = raw pixels
+  //   1 = single color (RLE of entire tile)
+  //   2-127 = palette + RLE
+  //   128-255 = palette + raw subrects (subencoding & 0x7f = num colors)
+  const renderZRLE = useCallback((x, y, w, h, pixelData, state) => {
+    const container = canvasRef.current;
+    if (!container) return;
+    const canvas = container.querySelector('canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    // First 4 bytes = zlib data length
+    const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
+    if (pixelData.byteLength < 4) return;
+    const zlibLen = view.getUint32(0);
+    if (4 + zlibLen > pixelData.byteLength) {
+      console.warn('[VNC] ZRLE: incomplete zlib data, need', 4 + zlibLen, 'have', pixelData.byteLength);
+      return;
+    }
+
+    // Decompress
+    let decompressed;
+    try {
+      decompressed = pako.inflate(pixelData.slice(4, 4 + zlibLen));
+    } catch (e) {
+      console.warn('[VNC] ZRLE inflate failed:', e);
+      return;
+    }
+
+    const dv = new DataView(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength);
+    const bypp = state.bytesPerPixel;
+    let offset = 0;
+
+    // Helper: read a pixel from decompressed data
+    const readPixel = (off) => {
+      if (bypp === 4) return dv.getUint32(off, state.bigEndian === 0);
+      if (bypp === 2) return dv.getUint16(off, state.bigEndian === 0);
+      return dv.getUint8(off);
     };
 
-    ws.onerror = (e) => {
-      console.error('VNC viewer WS error:', e);
-      setStatus('error');
-    };
-    ws.onclose = () => {
-      setStatus('disconnected');
-      wsRef.current = null;
-    };
-  }, [token, renderFrame]);
+    // Process 64x64 tiles
+    for (let ty = 0; ty < h; ty += 64) {
+      for (let tx = 0; tx < w; tx += 64) {
+        const tw = Math.min(64, w - tx);
+        const th = Math.min(64, h - ty);
+        const tilePixels = tw * th;
 
-  const disconnect = useCallback(() => {
+        if (offset + 1 > dv.byteLength) return;
+
+        const subenc = dv.getUint8(offset);
+        offset++;
+
+        if (subenc === 0) {
+          // Raw tile
+          const tileBytes = tilePixels * bypp;
+          if (offset + tileBytes > dv.byteLength) return;
+          const tileData = new Uint8Array(decompressed.buffer, decompressed.byteOffset + offset, tileBytes);
+          renderRAW(x + tx, y + ty, tw, th, tileData, state);
+          offset += tileBytes;
+        } else if (subenc === 1) {
+          // Single color (RLE of entire tile)
+          if (offset + bypp > dv.byteLength) return;
+          const pixel = readPixel(offset);
+          offset += bypp;
+          const [r, g, b, a] = pixelToRGBA(pixel, state);
+          const tileImg = ctx.createImageData(tw, th);
+          for (let i = 0; i < tilePixels; i++) {
+            tileImg.data[i * 4] = r;
+            tileImg.data[i * 4 + 1] = g;
+            tileImg.data[i * 4 + 2] = b;
+            tileImg.data[i * 4 + 3] = a;
+          }
+          ctx.putImageData(tileImg, x + tx, y + ty);
+        } else if (subenc <= 127) {
+          // Palette + RLE
+          // Read palette colors
+          const palette = [];
+          for (let p = 0; p < subenc; p++) {
+            if (offset + bypp > dv.byteLength) return;
+            palette.push(readPixel(offset));
+            offset += bypp;
+          }
+          // Read RLE data: index byte (0-127 = palette index, 128-255 = run length follows)
+          const tileImg = ctx.createImageData(tw, th);
+          let idx = 0;
+          while (idx < tilePixels) {
+            if (offset + 1 > dv.byteLength) return;
+            const idxByte = dv.getUint8(offset);
+            offset++;
+            const palIdx = idxByte & 0x7f;
+            let runLen = 1;
+            if (idxByte & 0x80) {
+              if (offset + 1 > dv.byteLength) return;
+              runLen = dv.getUint8(offset) + 1;
+              offset++;
+            }
+            const [r, g, b, a] = pixelToRGBA(palette[palIdx], state);
+            for (let r2 = 0; r2 < runLen && idx < tilePixels; r2++, idx++) {
+              tileImg.data[idx * 4] = r;
+              tileImg.data[idx * 4 + 1] = g;
+              tileImg.data[idx * 4 + 2] = b;
+              tileImg.data[idx * 4 + 3] = a;
+            }
+          }
+          ctx.putImageData(tileImg, x + tx, y + ty);
+        } else {
+          // 128-255: palette + raw subrects (subenc & 0x7f = num palette entries)
+          const numColors = subenc & 0x7f;
+          const palette = [];
+          for (let p = 0; p < numColors; p++) {
+            if (offset + bypp > dv.byteLength) return;
+            palette.push(readPixel(offset));
+            offset += bypp;
+          }
+          // Read numColors bytes per pixel (packed indices)
+          // Each pixel is a palette index (numColors <= 127, so 1 byte each)
+          const tileImg = ctx.createImageData(tw, th);
+          for (let i = 0; i < tilePixels; i++) {
+            if (offset + 1 > dv.byteLength) return;
+            const palIdx = dv.getUint8(offset);
+            offset++;
+            const [r, g, b, a] = pixelToRGBA(palette[palIdx], state);
+            tileImg.data[i * 4] = r;
+            tileImg.data[i * 4 + 1] = g;
+            tileImg.data[i * 4 + 2] = b;
+            tileImg.data[i * 4 + 3] = a;
+          }
+          ctx.putImageData(tileImg, x + tx, y + ty);
+        }
+      }
+    }
+  }, [pixelToRGBA, renderRAW]);
+  // Parse the RFB byte stream from the buffer
+  const parseStream = useCallback(() => {
+    const state = parseStateRef.current;
+    if (!state) return;
+
+    let keepParsing = true;
+    while (keepParsing) {
+      const buf = streamBufRef.current;
+
+      if (!state.gotMeta) {
+        // Expect RFBF meta header (24 bytes): "RFBF" + width(2) + height(2) +
+        // bpp(1) + depth(1) + bigEndian(1) + trueColor(1) + R/G/B max(2 each) +
+        // R/G/B shift(1 each) + reserved(3)
+        if (buf.byteLength < 24) { keepParsing = false; break; }
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+
+        // Check magic
+        if (buf[0] !== 'R'.charCodeAt(0) || buf[1] !== 'F'.charCodeAt(0) ||
+            buf[2] !== 'B'.charCodeAt(0) || buf[3] !== 'F'.charCodeAt(0)) {
+          console.warn('[VNC] No RFBF meta, starting message phase directly');
+          state.gotMeta = true;
+          state.phase = 'message';
+          continue;
+        }
+
+        state.width = view.getUint16(4);
+        state.height = view.getUint16(6);
+        state.bpp = view.getUint8(8);
+        state.bytesPerPixel = state.bpp / 8;
+        state.bigEndian = view.getUint8(10);
+        state.redMax = view.getUint16(12);
+        state.greenMax = view.getUint16(14);
+        state.blueMax = view.getUint16(16);
+        state.redShift = view.getUint8(18);
+        state.greenShift = view.getUint8(19);
+        state.blueShift = view.getUint8(20);
+
+        console.log('[VNC] RFBF meta:', {
+          width: state.width, height: state.height, bpp: state.bpp,
+          bytesPerPixel: state.bytesPerPixel, bigEndian: state.bigEndian,
+          redMax: state.redMax, greenMax: state.greenMax, blueMax: state.blueMax,
+          redShift: state.redShift, greenShift: state.greenShift, blueShift: state.blueShift,
+        });
+
+        // Resize canvas
+        const canvas = canvasRef.current?.querySelector('canvas');
+        if (canvas) {
+          canvas.width = state.width;
+          canvas.height = state.height;
+        }
+
+        consume(24);
+        state.gotMeta = true;
+        state.phase = 'message';
+        continue;
+      }
+
+      if (state.phase === 'message') {
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        if (buf.byteLength < 1) { keepParsing = false; break; }
+        const msgType = view.getUint8(0);
+
+        if (msgType === 0) {
+          // FramebufferUpdate: msgType(1) + padding(1) + numRects(2) + rect data
+          if (buf.byteLength < 4) { keepParsing = false; break; }
+          const numRects = view.getUint16(2);
+
+          let offset = 4;
+          let incomplete = false;
+
+          for (let r = 0; r < numRects; r++) {
+            if (offset + 12 > buf.byteLength) {
+              incomplete = true;
+              break;
+            }
+            const x = view.getUint16(offset);
+            const y = view.getUint16(offset + 2);
+            const w = view.getUint16(offset + 4);
+            const h = view.getUint16(offset + 6);
+            const encoding = view.getInt32(offset + 8);
+            offset += 12;
+
+            if (encoding === 0) {
+              // RAW
+              const pixelBytes = w * h * state.bytesPerPixel;
+              if (offset + pixelBytes > buf.byteLength) {
+                incomplete = true;
+                break;
+              }
+              const pixelData = buf.slice(offset, offset + pixelBytes);
+              renderRAW(x, y, w, h, pixelData, state);
+              offset += pixelBytes;
+            } else if (encoding === 5) {
+              // HEXTILE — variable size, parse from buffer
+              // We need to compute total size; let renderHEXTILE consume it
+              // For simplicity, consume all remaining data for this rect
+              // (the server sends the full rect data contiguously)
+              const rectData = buf.slice(offset);
+              renderHEXTILE(x, y, w, h, rectData, state);
+              // HEXTILE size is hard to predict; advance past all remaining
+              // In practice, one rect per FramebufferUpdate on rM
+              offset = buf.byteLength;
+            } else if (encoding === 16) {
+              // ZRLE: 4-byte zlib length + zlib-compressed tile data
+              // The zlib length tells us exactly how much data to consume
+              if (offset + 4 > buf.byteLength) {
+                incomplete = true;
+                break;
+              }
+              const zlibLen = view.getUint32(offset);
+              const totalRectLen = 4 + zlibLen;
+              if (offset + totalRectLen > buf.byteLength) {
+                incomplete = true;
+                break;
+              }
+              const rectData = buf.slice(offset, offset + totalRectLen);
+              renderZRLE(x, y, w, h, rectData, state);
+              offset += totalRectLen;
+            } else if (encoding === -223) {
+              // DesktopSize
+              state.width = w;
+              state.height = h;
+              const canvas = canvasRef.current?.querySelector('canvas');
+              if (canvas) { canvas.width = w; canvas.height = h; }
+            } else if (encoding === -239) {
+              // Cursor pseudo-encoding
+              const pixelBytes = w * h * state.bytesPerPixel;
+              const maskBytes = Math.ceil((w * h) / 8);
+              if (offset + pixelBytes + maskBytes > buf.byteLength) {
+                incomplete = true;
+                break;
+              }
+              offset += pixelBytes + maskBytes;
+            } else {
+              console.warn('[VNC] Unknown encoding:', encoding);
+              offset = buf.byteLength;
+              break;
+            }
+          }
+
+          if (incomplete) {
+            keepParsing = false;
+            break;
+          }
+
+          consume(offset);
+          setStats(prev => ({
+            frames: prev.frames + 1,
+            bytes: prev.bytes + offset,
+          }));
+        } else if (msgType === 1) {
+          // SetColourMapEntries
+          if (buf.byteLength < 8) { keepParsing = false; break; }
+          const numColours = view.getUint16(6);
+          const totalLen = 8 + numColours * 6;
+          if (buf.byteLength < totalLen) { keepParsing = false; break; }
+          consume(totalLen);
+        } else if (msgType === 2) {
+          // Bell
+          consume(1);
+        } else if (msgType === 3) {
+          // ServerCutText
+          if (buf.byteLength < 8) { keepParsing = false; break; }
+          const length = view.getUint32(4);
+          const totalLen = 8 + length;
+          if (buf.byteLength < totalLen) { keepParsing = false; break; }
+          consume(totalLen);
+        } else {
+          console.warn('[VNC] Unknown msg type:', msgType);
+          consume(1);
+        }
+      }
+    }
+  }, [consume, renderRAW, renderHEXTILE, renderZRLE]);
+
+  const connectVNC = useCallback(() => {
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
     }
-    setStatus('idle');
-    bufferRef.current = new Uint8Array(0);
-    setBufSize(0);
+
+    setStatus('connecting');
+    setError(null);
+    setStats({ frames: 0, bytes: 0 });
+    initParser();
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}${ROOT_URL}/screenshare/vnc/stream`;
+    const token = localStorage.getItem('authToken');
+    const urlWithToken = token ? `${wsUrl}?token=${encodeURIComponent(token)}` : wsUrl;
+
+    const ws = new WebSocket(urlWithToken);
+    ws.binaryType = 'arraybuffer';
+    wsRef.current = ws;
+
+    const container = canvasRef.current;
+    if (container) {
+      container.innerHTML = '';
+      const canvas = document.createElement('canvas');
+      canvas.width = 1404;
+      canvas.height = 1872;
+      canvas.style.maxWidth = '100%';
+      canvas.style.maxHeight = '100%';
+      canvas.style.imageRendering = 'pixelated';
+      canvas.style.background = '#fff';
+      container.appendChild(canvas);
+    }
+
+    ws.onopen = () => {
+      setStatus('connected');
+      console.log('[VNC] WebSocket connected');
+    };
+
+    ws.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) {
+        appendData(new Uint8Array(e.data));
+        parseStream();
+      }
+    };
+
+    ws.onerror = () => {
+      setError('WebSocket error');
+      setStatus('error');
+    };
+
+    ws.onclose = (e) => {
+      setStatus('disconnected');
+      if (e.code !== 1000) {
+        setError(`Connection closed (code: ${e.code})`);
+      }
+      wsRef.current = null;
+    };
+  }, [appendData, parseStream, initParser]);
+
+  const disconnectVNC = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setStatus('disconnected');
   }, []);
 
   useEffect(() => {
     return () => {
-      if (wsRef.current) wsRef.current.close();
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
     };
   }, []);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
-      <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
-        {status !== 'connected' && (
-          <button
-            onClick={connect}
-            disabled={status === 'connecting'}
-            style={{
-              padding: '8px 16px',
-              cursor: status === 'connecting' ? 'wait' : 'pointer',
-              background: status === 'connecting' ? '#ccc' : '#1976d2',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              fontSize: '14px',
-            }}
-          >
-            {status === 'connecting' ? 'Connecting...' : 'Connect'}
-          </button>
-        )}
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div style={{
+        padding: '8px 16px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '12px',
+        borderBottom: '1px solid #e0e0e0',
+        background: '#fafafa'
+      }}>
+        <button
+          onClick={status === 'connected' ? disconnectVNC : connectVNC}
+          style={{
+            padding: '6px 16px',
+            borderRadius: '4px',
+            border: 'none',
+            background: status === 'connected' ? '#e53e3e' : '#38a169',
+            color: 'white',
+            cursor: 'pointer',
+            fontSize: '14px',
+          }}
+        >
+          {status === 'connected' ? 'Disconnect' : 'Connect'}
+        </button>
+        <span style={{ fontSize: '14px', color: '#666' }}>
+          Status: <strong style={{
+            color: status === 'connected' ? '#38a169' : status === 'error' ? '#e53e3e' : '#666'
+          }}>{status}</strong>
+        </span>
         {status === 'connected' && (
-          <button
-            onClick={disconnect}
-            style={{
-              padding: '8px 16px',
-              cursor: 'pointer',
-              background: '#d32f2f',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              fontSize: '14px',
-            }}
-          >
-            Disconnect
-          </button>
+          <span style={{ fontSize: '12px', color: '#999' }}>
+            {stats.frames} frames · {(stats.bytes / 1024 / 1024).toFixed(1)} MB
+          </span>
         )}
-        <span style={{ fontSize: '13px', color: '#666' }}>
-          Status: {status} | Frames: {frameCount} | FPS: {fps} | Buffer: {(bufSize / 1024).toFixed(0)}KB
+        {error && (
+          <span style={{ fontSize: '13px', color: '#e53e3e' }}>{error}</span>
+        )}
+        <span style={{ fontSize: '12px', color: '#999', marginLeft: 'auto' }}>
+          reMarkable Live View (VNC)
         </span>
       </div>
-      <canvas
+      <div
         ref={canvasRef}
         style={{
-          maxWidth: '100%',
-          maxHeight: '75vh',
-          border: status === 'connected' ? '1px solid #ccc' : '1px dashed #ccc',
-          background: '#f5f5f5',
-          imageRendering: 'auto',
+          flex: 1,
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          background: '#f0f0f0',
+          overflow: 'hidden',
         }}
       />
-      {status === 'idle' && (
-        <p style={{ color: '#999', fontSize: '14px' }}>
-          Click Connect to start viewing the reMarkable screen.
-        </p>
-      )}
     </div>
   );
 }
