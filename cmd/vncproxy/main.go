@@ -8,7 +8,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"io"
 	"log"
 	"net"
@@ -103,116 +102,41 @@ func main() {
 	}()
 
 	// Pipe restream stdout → WebSocket
-	// restream outputs LZ4 frames (magic: 04 22 4D 18). We buffer the stdout
-	// and only forward complete LZ4 frames so the viewer can decompress each
-	// WebSocket message independently.
+	// Simple approach: forward raw chunks. The viewer reassembles LZ4 frames.
 	frameCount := 0
 	totalBytes := 0
-	readBuf := make([]byte, 65536)
-	var accum []byte // accumulated data from restream
+	buf := make([]byte, 65536)
 	reconnectAttempts := 0
 
-	// LZ4 frame magic
-	lz4Magic := []byte{0x04, 0x22, 0x4D, 0x18}
-
 	for {
-		n, err := stdout.Read(readBuf)
+		n, err := stdout.Read(buf)
 		if n > 0 {
-			accum = append(accum, readBuf[:n]...)
-
-			// Extract complete LZ4 frames from the accumulated buffer.
-			// A complete frame is from one magic to the next magic (or end).
-			for {
-				// Find first magic
-				firstMagic := bytes.Index(accum, lz4Magic)
-				if firstMagic < 0 {
-					// No magic yet — discard data before a reasonable point
-					// Keep last 4 bytes in case magic spans a chunk boundary
-					if len(accum) > 4 {
-						accum = accum[len(accum)-4:]
+			data := buf[:n]
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				log.Printf("WS write: %v", err)
+				wsConn.Close()
+				for reconnectAttempts < 3 {
+					reconnectAttempts++
+					log.Printf("Reconnecting to WS (attempt %d)...", reconnectAttempts)
+					time.Sleep(2 * time.Second)
+					wsConn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
+					if err != nil {
+						log.Printf("Reconnect failed: %v", err)
+						continue
 					}
+					wsConn.WriteMessage(websocket.TextMessage, []byte(meta))
+					reconnectAttempts = 0
 					break
 				}
-
-				// Discard any data before the first magic
-				if firstMagic > 0 {
-					accum = accum[firstMagic:]
+				if reconnectAttempts >= 3 {
+					log.Fatal("Max reconnect attempts reached")
 				}
-
-				// Find next magic (end of current frame)
-				nextMagic := bytes.Index(accum[4:], lz4Magic)
-				if nextMagic < 0 {
-					// No next magic — wait for more data
-					// But if we have a lot of data, try sending it as one frame
-					if len(accum) < 3*1024*1024 {
-						break
-					}
-					// Enough data — send as one frame
-					frameData := make([]byte, len(accum))
-					copy(frameData, accum)
-					accum = accum[:0]
-
-					if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, frameData); wsErr != nil {
-						log.Printf("WS write: %v", wsErr)
-						wsConn.Close()
-						for reconnectAttempts < 3 {
-							reconnectAttempts++
-							log.Printf("Reconnecting to WS (attempt %d)...", reconnectAttempts)
-							time.Sleep(2 * time.Second)
-							wsConn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
-							if err != nil {
-								log.Printf("Reconnect failed: %v", err)
-								continue
-							}
-							wsConn.WriteMessage(websocket.TextMessage, []byte(meta))
-							reconnectAttempts = 0
-							break
-						}
-						if reconnectAttempts >= 3 {
-							log.Fatal("Max reconnect attempts reached")
-						}
-						break
-					}
-					frameCount++
-					totalBytes += len(frameData)
-					if frameCount%10 == 0 {
-						log.Printf("  streamed %d frames (total=%d bytes)", frameCount, totalBytes)
-					}
-					break
-				}
-
-				// We have a complete frame from 0 to nextMagic+4
-				endIdx := nextMagic + 4
-				frameData := make([]byte, endIdx)
-				copy(frameData, accum[:endIdx])
-				accum = accum[endIdx:]
-
-				if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, frameData); wsErr != nil {
-					log.Printf("WS write: %v", wsErr)
-					wsConn.Close()
-					for reconnectAttempts < 3 {
-						reconnectAttempts++
-						log.Printf("Reconnecting to WS (attempt %d)...", reconnectAttempts)
-						time.Sleep(2 * time.Second)
-						wsConn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
-						if err != nil {
-							log.Printf("Reconnect failed: %v", err)
-							continue
-						}
-						wsConn.WriteMessage(websocket.TextMessage, []byte(meta))
-						reconnectAttempts = 0
-						break
-					}
-					if reconnectAttempts >= 3 {
-						log.Fatal("Max reconnect attempts reached")
-					}
-					continue
-				}
-				frameCount++
-				totalBytes += len(frameData)
-				if frameCount%10 == 0 {
-					log.Printf("  streamed %d frames (total=%d bytes)", frameCount, totalBytes)
-				}
+				continue
+			}
+			frameCount++
+			totalBytes += n
+			if frameCount%100 == 0 {
+				log.Printf("  streamed %d chunks (total=%d bytes)", frameCount, totalBytes)
 			}
 		}
 		if err == io.EOF {
