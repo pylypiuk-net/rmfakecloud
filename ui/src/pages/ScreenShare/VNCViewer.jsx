@@ -251,6 +251,7 @@ export default function VNCViewer() {
       // FramebufferUpdate as a complete zlib stream (with header + finalization)
       state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), true);
       decompressed = state.zrleInflate.result;
+      console.log('[VNC] ZRLE inflate result:', decompressed ? decompressed.length : 'null', 'bytes, first 8:', decompressed ? Array.from(decompressed.slice(0, 8)).join(',') : 'null');
       if (!decompressed || decompressed.length === 0) {
         return; // no output available
       }
@@ -283,6 +284,7 @@ export default function VNCViewer() {
         if (offset + 1 > dv.byteLength) return;
 
         const subenc = dv.getUint8(offset);
+        if (ty === 0 && tx === 0) console.log('[VNC] ZRLE first tile subenc:', subenc, 'offset:', offset);
         offset++;
 
         if (subenc === 0) {
