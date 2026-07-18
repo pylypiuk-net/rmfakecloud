@@ -175,8 +175,14 @@ func main() {
 		mu.Unlock()
 
 		// Send SetEncodings + FramebufferUpdateRequest, then pipe to server
-		go pipeRFBStream(tlsConn, serverHost, serverPort, deviceToken, serverInfo)
-	}
+		pipeRFBStream(tlsConn, serverHost, serverPort, deviceToken, serverInfo)
+
+		// Reset connected flag so we can accept new broadcasts
+		mu.Lock()
+		connected = false
+		mu.Unlock()
+		log.Printf("Ready for next broadcast...")
+		}
 }
 
 // serverInitInfo holds parsed ServerInit data
