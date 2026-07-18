@@ -323,7 +323,7 @@ func generateJWT(secret, deviceID, deviceDesc string) (string, error) {
 		"jti":          fmt.Sprintf("%d", now.UnixNano()),
 		"iat":          now.Unix(),
 		"iss":          "rM WebApp",
-		"nbf":          now.Unix(),
+		"nbf":          now.Add(-5 * time.Minute).Unix(), // skew tolerance
 		"sub":          "ypyly",
 	}
 
