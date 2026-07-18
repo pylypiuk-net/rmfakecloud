@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ddvk/rmfakecloud/internal/common"
 	"github.com/gin-gonic/gin"
@@ -27,42 +28,79 @@ var upgraderVNC = websocket.Upgrader{
 }
 
 // vnHub bridges the tablet VNC proxy to web UI viewers.
-var vnHub = &VNCHub{
-	broadcast: make(chan []byte, 4096),
-	register:  make(chan *websocket.Conn, 1),
-}
+var vnHub = newVNCHub()
 
 type VNCHub struct {
-	mu        sync.Mutex
-	clients   map[*websocket.Conn]bool
+	mu       sync.Mutex
+	clients  map[*websocket.Conn]bool
 	broadcast chan []byte
 	register  chan *websocket.Conn
+	// stats
+	totalBytes   uint64
+	totalFrames  uint64
 }
 
+func newVNCHub() *VNCHub {
+	h := &VNCHub{
+		clients:  make(map[*websocket.Conn]bool),
+		broadcast: make(chan []byte, 4096),
+		register:  make(chan *websocket.Conn, 16),
+	}
+	go h.run()
+	return h
+}
+
+// run uses two separate goroutines so broadcast traffic can never
+// starve client registration (and vice versa).
 func (h *VNCHub) run() {
-	h.clients = make(map[*websocket.Conn]bool)
-	for {
-		select {
-		case data := <-h.broadcast:
-			h.mu.Lock()
-			for client := range h.clients {
-				err := client.WriteMessage(websocket.BinaryMessage, data)
-				if err != nil {
-					delete(h.clients, client)
-					client.Close()
-				}
-			}
-			h.mu.Unlock()
-		case client := <-h.register:
+	// Registration goroutine — never blocked by broadcast traffic.
+	go func() {
+		for client := range h.register {
 			h.mu.Lock()
 			h.clients[client] = true
+			n := len(h.clients)
 			h.mu.Unlock()
+			log.Infof("[vnc-hub] client registered, total: %d", n)
+		}
+	}()
+
+	// Broadcast loop — fans out to all registered clients.
+	for data := range h.broadcast {
+		atomic.AddUint64(&h.totalBytes, uint64(len(data)))
+		atomic.AddUint64(&h.totalFrames, 1)
+
+		h.mu.Lock()
+		for client := range h.clients {
+			if err := client.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				delete(h.clients, client)
+				client.Close()
+			}
+		}
+		n := len(h.clients)
+		h.mu.Unlock()
+
+		// Log every 500th frame to avoid spam.
+		frames := atomic.LoadUint64(&h.totalFrames)
+		if frames%500 == 0 {
+			bytes := atomic.LoadUint64(&h.totalBytes)
+			log.Infof("[vnc-hub] frame %d, %d bytes total, %d clients", frames, bytes, n)
 		}
 	}
 }
 
-func init() {
-	go vnHub.run()
+// registerClient adds a web UI viewer to the hub.
+func (h *VNCHub) registerClient(ws *websocket.Conn) {
+	h.register <- ws
+}
+
+// push broadcasts RFB data from the tablet proxy to all viewers.
+func (h *VNCHub) push(data []byte) {
+	select {
+	case h.broadcast <- data:
+	default:
+		// Channel full — drop frame to avoid blocking the proxy.
+		log.Warn("[vnc-hub] broadcast channel full, dropping frame")
+	}
 }
 
 // vncStreamHandler: web UI connects here via WebSocket to receive VNC frames
@@ -75,7 +113,7 @@ func (app *ReactAppWrapper) vncStreamHandler(c *gin.Context) {
 	defer ws.Close()
 
 	log.Info("VNC: web UI client connected")
-	vnHub.register <- ws
+	vnHub.registerClient(ws)
 
 	// Keep connection alive, read any input events from web UI
 	for {
@@ -85,6 +123,11 @@ func (app *ReactAppWrapper) vncStreamHandler(c *gin.Context) {
 		}
 	}
 	log.Info("VNC: web UI client disconnected")
+
+	// Remove from hub
+	vnHub.mu.Lock()
+	delete(vnHub.clients, ws)
+	vnHub.mu.Unlock()
 }
 
 // vncProxyConnectHandler: tablet proxy connects here to push RFB data.
@@ -139,8 +182,8 @@ func (app *ReactAppWrapper) vncProxyConnectHandler(c *gin.Context) {
 			break
 		}
 		if msgType == websocket.BinaryMessage {
-				vnHub.broadcast <- data
-			}
+			vnHub.push(data)
+		}
 	}
 
 	log.Info("[vnc-proxy] tablet proxy disconnected")
