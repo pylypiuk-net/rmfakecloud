@@ -40,6 +40,7 @@ export default function VNCViewer() {
       blueShift: 16,
       gotMeta: false,
       phase: 'meta', // start expecting RFBF meta
+      zrleInflate: null, // persistent pako Inflate for ZRLE zlib stream
     };
   }, []);
 
@@ -237,12 +238,22 @@ export default function VNCViewer() {
       return;
     }
 
-    // Decompress
+    // Decompress using persistent ZRLE zlib stream
     let decompressed;
     try {
-      decompressed = pako.inflate(pixelData.slice(4, 4 + zlibLen));
+      if (!state.zrleInflate) {
+        state.zrleInflate = new pako.Inflate({ raw: false });
+      }
+      state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), false);
+      decompressed = state.zrleInflate.result;
+      if (!decompressed || decompressed.length === 0) {
+        // Some incremental frames produce no output yet (need more data)
+        return;
+      }
     } catch (e) {
       console.warn('[VNC] ZRLE inflate failed:', e);
+      // Reset inflate on error — next full frame will restart the stream
+      state.zrleInflate = null;
       return;
     }
 

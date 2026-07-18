@@ -159,6 +159,10 @@ func (app *ReactAppWrapper) vncStreamHandler(c *gin.Context) {
 		ws.SetReadDeadline(time.Now().Add(90 * time.Second))
 		return ws.WriteMessage(websocket.PongMessage, []byte(app))
 	})
+	ws.SetPongHandler(func(app string) error {
+		ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return nil
+	})
 
 	log.Info("VNC: web UI client connected")
 	vnHub.registerClient(ws)
