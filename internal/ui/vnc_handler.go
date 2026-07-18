@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ddvk/rmfakecloud/internal/common"
 	"github.com/gin-gonic/gin"
@@ -31,18 +32,25 @@ var upgraderVNC = websocket.Upgrader{
 var vnHub = newVNCHub()
 
 type VNCHub struct {
-	mu       sync.Mutex
-	clients  map[*websocket.Conn]bool
+	mu        sync.Mutex
+	clients   map[*websocket.Conn]bool
 	broadcast chan []byte
 	register  chan *websocket.Conn
+	// lastFrame caches the most recent frame data so newly connected
+	// viewers immediately see the current screen instead of waiting
+	// for the next change.
+	lastFrame []byte
+	// lastMeta caches the RFBF meta (pixel format) — sent first to
+	// every new client so the viewer knows how to decode frames.
+	lastMeta []byte
 	// stats
-	totalBytes   uint64
-	totalFrames  uint64
+	totalBytes  uint64
+	totalFrames uint64
 }
 
 func newVNCHub() *VNCHub {
 	h := &VNCHub{
-		clients:  make(map[*websocket.Conn]bool),
+		clients:   make(map[*websocket.Conn]bool),
 		broadcast: make(chan []byte, 4096),
 		register:  make(chan *websocket.Conn, 16),
 	}
@@ -50,17 +58,32 @@ func newVNCHub() *VNCHub {
 	return h
 }
 
+// isRFBFMeta returns true if data is the 24-byte RFBF pixel-format header.
+func isRFBFMeta(data []byte) bool {
+	return len(data) == 24 && data[0] == 'R' && data[1] == 'F' && data[2] == 'B' && data[3] == 'F'
+}
+
 // run uses two separate goroutines so broadcast traffic can never
 // starve client registration (and vice versa).
 func (h *VNCHub) run() {
 	// Registration goroutine — never blocked by broadcast traffic.
+	// Sends cached meta + last frame to the new client immediately.
 	go func() {
 		for client := range h.register {
 			h.mu.Lock()
 			h.clients[client] = true
 			n := len(h.clients)
+			// Replay cached meta + last frame so the viewer sees the
+			// current screen without waiting for the next change.
+			if h.lastMeta != nil {
+				client.WriteMessage(websocket.BinaryMessage, h.lastMeta)
+			}
+			if h.lastFrame != nil {
+				client.WriteMessage(websocket.BinaryMessage, h.lastFrame)
+			}
 			h.mu.Unlock()
-			log.Infof("[vnc-hub] client registered, total: %d", n)
+			log.Infof("[vnc-hub] client registered, total: %d (replayed %d meta + %d frame bytes)",
+				n, len(h.lastMeta), len(h.lastFrame))
 		}
 	}()
 
@@ -68,6 +91,25 @@ func (h *VNCHub) run() {
 	for data := range h.broadcast {
 		atomic.AddUint64(&h.totalBytes, uint64(len(data)))
 		atomic.AddUint64(&h.totalFrames, 1)
+
+		// Cache meta and full frames for late joiners.
+		if isRFBFMeta(data) {
+			h.mu.Lock()
+			h.lastMeta = data
+			h.mu.Unlock()
+		} else {
+			// Heuristic: a FramebufferUpdate with a full-screen rect
+			// (1404x1872) is a "full frame" — cache it. Small incremental
+			// updates are NOT cached (they're deltas on top of the
+			// last full frame). We detect full frames by size: the
+			// smallest full ZRLE frame is ~20KB; incremental updates
+			// are typically < 5KB. To be safe, cache any frame > 10KB.
+			if len(data) > 10240 {
+				h.mu.Lock()
+				h.lastFrame = data
+				h.mu.Unlock()
+			}
+		}
 
 		h.mu.Lock()
 		for client := range h.clients {
@@ -112,8 +154,27 @@ func (app *ReactAppWrapper) vncStreamHandler(c *gin.Context) {
 	}
 	defer ws.Close()
 
+	// Set ping/pong deadlines to keep the connection alive through
+	// proxies/load-balancers that idle-timeout after ~30-60s.
+	ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+	ws.SetPingHandler(func(app string) error {
+		ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return ws.WriteMessage(websocket.PongMessage, []byte(app))
+	})
+
 	log.Info("VNC: web UI client connected")
 	vnHub.registerClient(ws)
+
+	// Periodically ping the client to keep the connection alive.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}()
 
 	// Keep connection alive, read any input events from web UI
 	for {
