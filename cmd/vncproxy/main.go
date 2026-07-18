@@ -15,8 +15,6 @@
 package main
 
 import (
-	"bytes"
-	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -442,137 +440,8 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
 
-	// Persistent zlib reader for ZRLE stream — the rM VNC server uses a
-	// single continuous zlib stream across all frames. We decompress here
-	// and re-compress each frame as a standalone zlib stream so the viewer
-	// can use pako.inflate() per frame (no persistent context needed).
-	var zr io.ReadCloser // lazy-initialized zlib reader
-	zrBuf := new(bytes.Buffer)
-	defer func() {
-		if zr != nil {
-			zr.Close()
-		}
-	}()
-
-	// decodeZRLEFrame decompresses ZRLE zlib data and re-compresses as
-	// a standalone zlib stream. Returns the new rect data (4-byte length +
-	// zlib data) ready to embed in the FramebufferUpdate.
-	decodeZRLEFrame := func(zlibData []byte) []byte {
-		// Write to the persistent buffer for the zlib reader
-		zrBuf.Write(zlibData)
-
-		// Initialize zlib reader on first call
-		if zr == nil {
-			var err error
-			zr, err = zlib.NewReader(zrBuf)
-			if err != nil {
-				log.Printf("  ZRLE zlib new reader error: %v", err)
-				return nil
-			}
-		}
-
-		// Read all available decompressed data
-		decompressed, err := io.ReadAll(zr)
-		if err != nil && err != io.EOF {
-			// ZRLE stream may not be complete yet — partial decompression
-			log.Printf("  ZRLE decompress partial: %d bytes, err: %v", len(decompressed), err)
-		}
-
-		if len(decompressed) == 0 {
-			return nil
-		}
-
-		// Re-compress as standalone zlib stream
-		var recompressed bytes.Buffer
-		w := zlib.NewWriter(&recompressed)
-		w.Write(decompressed)
-		w.Close()
-
-		// Build new rect data: 4-byte length + zlib data
-		out := make([]byte, 4+recompressed.Len())
-		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
-		copy(out[4:], recompressed.Bytes())
-
-		return out
-	}
-
-	// decodeZRLEInPlace finds ZRLE rects in a FramebufferUpdate, decompresses
-	// them via decodeZRLEFrame, and rebuilds the message with standalone zlib.
-	decodeZRLEInPlace := func(msg []byte, info serverInitInfo, decode func([]byte) []byte) []byte {
-		if len(msg) < 4 {
-			return msg
-		}
-		numRects := int(binary.BigEndian.Uint16(msg[2:4]))
-		offset := 4
-		rects := make([][]byte, 0, numRects)
-		changed := false
-
-		for r := 0; r < numRects; r++ {
-			if offset+12 > len(msg) {
-				return msg // malformed, send original
-			}
-			rectHeader := msg[offset : offset+12]
-			enc := int32(binary.BigEndian.Uint32(rectHeader[8:12]))
-			rectStart := offset
-
-			if enc == 16 { // ZRLE
-				if offset+16 > len(msg) {
-					rects = append(rects, msg[rectStart:])
-					break
-				}
-				zlibLen := int(binary.BigEndian.Uint32(msg[offset+12 : offset+16]))
-				if offset+16+zlibLen > len(msg) {
-					rects = append(rects, msg[rectStart:])
-					break
-				}
-				zlibData := msg[offset+16 : offset+16+zlibLen]
-				newData := decode(zlibData)
-				if newData == nil {
-					// Decompression not ready yet — skip this frame
-					return nil
-				}
-				// Build new rect: header (12 bytes) + 4-byte length + zlib data
-				newRect := make([]byte, 12+len(newData))
-				copy(newRect[:12], rectHeader)
-				copy(newRect[12:], newData)
-				rects = append(rects, newRect)
-				offset += 16 + zlibLen
-				changed = true
-			} else if enc == 0 { // RAW
-				rectLen := int(binary.BigEndian.Uint16(msg[offset+4:offset+6])) *
-					int(binary.BigEndian.Uint16(msg[offset+6:offset+8])) *
-					int(info.bpp) / 8
-				if offset+12+rectLen > len(msg) {
-					rects = append(rects, msg[rectStart:])
-					break
-				}
-				rects = append(rects, msg[rectStart:offset+12+rectLen])
-				offset += 12 + rectLen
-			} else {
-				// Other encodings — pass through (DesktopSize, Cursor, etc.)
-				if enc == -223 { // DesktopSize: no data
-					rects = append(rects, msg[rectStart:offset+12])
-					offset += 12
-				} else {
-					// Unknown — pass rest
-					rects = append(rects, msg[rectStart:])
-					break
-				}
-			}
-		}
-
-		if !changed {
-			return msg
-		}
-
-		// Rebuild message: msgType(1) + pad(1) + numRects(2) + rects
-		var out bytes.Buffer
-		out.Write(msg[:4]) // header
-		for _, rect := range rects {
-			out.Write(rect)
-		}
-		return out.Bytes()
-	}
+	// No server-side ZRLE decompression — forward raw ZRLE to the viewer.
+	// The viewer maintains a persistent pako.Inflate with onData callback.
 
 	done := make(chan struct{}, 2)
 	totalBytes := 0
@@ -707,19 +576,6 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 
 				if consumed {
 					msg := frameBuf[:msgLen]
-
-					// If this is a FramebufferUpdate with ZRLE, decompress and
-					// re-encode as standalone zlib so the viewer can use pako.inflate()
-					if msgType == 0 {
-						decoded := decodeZRLEInPlace(msg, *info, decodeZRLEFrame)
-						if decoded == nil {
-							// Frame not ready (partial decompression) — skip
-							frameBuf = frameBuf[msgLen:]
-							continue
-						}
-						msg = decoded
-					}
-
 					if err := wsConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
 						log.Printf("WS write ended: %v", err)
 						done <- struct{}{}
