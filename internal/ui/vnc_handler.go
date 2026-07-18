@@ -73,16 +73,14 @@ func (h *VNCHub) run() {
 			h.mu.Lock()
 			h.clients[client] = true
 			n := len(h.clients)
-			// Replay cached meta + last frame so the viewer sees the
-			// current screen without waiting for the next change.
+			// Replay cached meta only — ZRLE frames can't be replayed
+			// because they use a persistent zlib stream. New viewers wait
+			// for the next full update (proxy requests one every 30s).
 			if h.lastMeta != nil {
 				client.WriteMessage(websocket.BinaryMessage, h.lastMeta)
 			}
-			if h.lastFrame != nil {
-				client.WriteMessage(websocket.BinaryMessage, h.lastFrame)
-			}
 			h.mu.Unlock()
-			log.Infof("[vnc-hub] client registered, total: %d (replayed %d meta + %d frame bytes)",
+			log.Infof("[vnc-hub] client registered, total: %d (replayed %d meta bytes, frame deferred to next full update)",
 				n, len(h.lastMeta), len(h.lastFrame))
 		}
 	}()

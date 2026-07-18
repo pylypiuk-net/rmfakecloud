@@ -353,7 +353,7 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	// Forcing RGB565 was likely the cause of the "all-zeros" issue.
 
 	// Send SetEncodings: message-type=2, padding=0, count=N, encodings
-	// Request multiple encodings like rmview — server picks the best one.
+	// Request multiple encodings like rmview — server picks ZRLE.
 	encodings := []int32{
 		HEXTILE_ENCODING,
 		CORRE_ENCODING,
@@ -599,6 +599,8 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
+		fullTicker := time.NewTicker(30 * time.Second)
+		defer fullTicker.Stop()
 		for {
 			select {
 			case <-ticker.C:
@@ -606,6 +608,15 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				if _, err := rfbConn.Write(fbReq); err != nil {
 					return
 				}
+			case <-fullTicker.C:
+				// Periodic full (non-incremental) update so new viewers
+				// get a fresh ZRLE zlib stream (ZRLE uses a persistent
+				// zlib context that can't be replayed from the middle)
+				fbReq[1] = 0 // non-incremental (full)
+				if _, err := rfbConn.Write(fbReq); err != nil {
+					return
+				}
+				log.Printf("Requested full screen refresh (for new viewers)")
 			case <-done:
 				return
 			}
