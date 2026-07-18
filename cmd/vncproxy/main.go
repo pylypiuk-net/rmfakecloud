@@ -64,16 +64,17 @@ func main() {
 	log.Printf("WS connected to %s", wsURL)
 
 	// Send metadata
-	meta := `{"type":"meta","width":1404,"height":1872,"bpp":2,"format":"rgb565le","compressed":"lz4"}`
+	meta := `{"type":"meta","width":1872,"height":1404,"bpp":1,"format":"gray8","compressed":"lz4"}`
 	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(meta)); err != nil {
 		log.Fatalf("WS write meta: %v", err)
 	}
 
 	// Start restream as subprocess
-	// reMarkable 2 firmware ≥3.24: 4bpp BGRA, 1872×1404 (landscape), LZ4 compressed
-	// reStream.sh: width=1872, height=1404, bytes_per_pixel=4, pixel_format=bgra
-	// transpose=2 (rotate 180°), skip_offset=4705256 (firmware ≥3.27)
-	cmd := exec.Command(restreamBin, "-w", "1872", "-h", "1404", "-b", "4", "-f", ":mem:")
+	// reMarkable 2 firmware 3.3.2: 1bpp gray8, 1872×1404 (landscape), LZ4 compressed
+	// The 4bpp mode fails (anonymous mapping after fb0 is only 8MB, not enough for 10.5MB frame)
+	// The 2bpp mode produces tiled output (bytes are duplicated — correlation 1.0 between high/low)
+	// 1bpp with skip=8 produces clean frames. Use restream v1.5.0 (has -s flag).
+	cmd := exec.Command(restreamBin, "-w", "1872", "-h", "1404", "-b", "1", "-s", "8", "-f", ":mem:")
 	cmd.Env = []string{"PATH=/opt/bin:/usr/bin:/bin"}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
