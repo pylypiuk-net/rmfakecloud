@@ -1,14 +1,13 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import lz4 from 'lz4js';
 
 const ROOT_URL = '/ui/api';
 
 // Framebuffer viewer for reMarkable screen sharing.
 // Data path: restream (-w 1872 -h 1404 -b 1 -s 8 -f :mem:) → LZ4 frame →
-//   fbproxy → WebSocket → rmfakecloud VNCHub → browser
+//   fbproxy (decompresses LZ4) → raw pixels → WebSocket → rmfakecloud VNCHub → browser
 //
-// The VNCHub forwards individual WebSocket read chunks (NOT complete LZ4 frames).
-// The viewer must reassemble chunks into complete LZ4 frames before decompressing.
+// The proxy decompresses LZ4 and sends complete raw frames (2,628,288 bytes each).
+// The viewer renders raw 4-bit grayscale pixels directly — no LZ4 decompression needed.
 //
 // Pixel format: 4-bit grayscale (0-15), 1872 wide × 1404 tall (landscape)
 // Rendering: scale 0-15 → 0-255 (×17), rotate 90° CCW → portrait (1404×1872)
@@ -17,19 +16,6 @@ const ROOT_URL = '/ui/api';
 const FB_WIDTH = 1872;
 const FB_HEIGHT = 1404;
 const FRAME_SIZE = FB_WIDTH * FB_HEIGHT; // 2,628,288 bytes (1 byte per pixel)
-
-// LZ4 frame magic: 04 22 4D 18
-const LZ4_MAGIC = [0x04, 0x22, 0x4D, 0x18];
-
-function findLZ4FrameMagic(buf, start) {
-  for (let i = start; i < buf.length - 3; i++) {
-    if (buf[i] === LZ4_MAGIC[0] && buf[i+1] === LZ4_MAGIC[1] &&
-        buf[i+2] === LZ4_MAGIC[2] && buf[i+3] === LZ4_MAGIC[3]) {
-      return i;
-    }
-  }
-  return -1;
-}
 
 export default function VNCViewer({ token, onDisconnect }) {
   const canvasRef = useRef(null);
@@ -106,56 +92,9 @@ export default function VNCViewer({ token, onDisconnect }) {
     ws.onmessage = (event) => {
       const data = new Uint8Array(event.data);
 
-      // Append to buffer
-      const prev = bufferRef.current;
-      const newBuf = new Uint8Array(prev.length + data.length);
-      newBuf.set(prev);
-      newBuf.set(data, prev.length);
-      bufferRef.current = newBuf;
-      setBufSize(newBuf.length);
-
-      // Try to extract and decompress complete LZ4 frames
-      const buf = bufferRef.current;
-
-      // Find the first LZ4 frame magic
-      let magicIdx = findLZ4FrameMagic(buf, 0);
-      if (magicIdx === -1) return;
-
-      // Find the next LZ4 frame magic (end of current frame)
-      let nextMagicIdx = findLZ4FrameMagic(buf, magicIdx + 4);
-      if (nextMagicIdx === -1) {
-        // No next frame yet — try decompressing from magicIdx to end
-        // Only attempt if we have enough data for a meaningful frame
-        if (buf.length - magicIdx < 10000) return;
-
-        try {
-          const frameData = buf.slice(magicIdx);
-          const decompressed = lz4.decompress(frameData, FRAME_SIZE);
-          if (decompressed && decompressed.length >= FRAME_SIZE) {
-            renderFrame(decompressed);
-            // Reset buffer — consumed everything
-            bufferRef.current = new Uint8Array(0);
-            setBufSize(0);
-          }
-        } catch (e) {
-          // Not enough data yet, wait for more
-        }
-      } else {
-        // We have a complete frame from magicIdx to nextMagicIdx
-        try {
-          const frameData = buf.slice(magicIdx, nextMagicIdx);
-          const decompressed = lz4.decompress(frameData, FRAME_SIZE);
-          if (decompressed && decompressed.length >= FRAME_SIZE) {
-            renderFrame(decompressed);
-            // Keep data from nextMagicIdx onwards
-            bufferRef.current = buf.slice(nextMagicIdx);
-            setBufSize(bufferRef.current.length);
-          }
-        } catch (e) {
-          // Decompression failed — skip to next magic
-          bufferRef.current = buf.slice(nextMagicIdx);
-          setBufSize(bufferRef.current.length);
-        }
+      // Each WebSocket message is a complete raw frame (FRAME_SIZE bytes)
+      if (data.length >= FRAME_SIZE) {
+        renderFrame(data);
       }
     };
 

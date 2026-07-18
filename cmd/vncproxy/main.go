@@ -25,6 +25,7 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/websocket"
+	"github.com/pierrec/lz4/v4"
 )
 
 const (
@@ -93,11 +94,9 @@ func main() {
 	defer wsConn.Close()
 	log.Printf("WS connected to %s", wsURL)
 
-	// Send metadata
-	meta := `{"type":"meta","width":1872,"height":1404,"bpp":1,"format":"gray8","compressed":"lz4"}`
-	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(meta)); err != nil {
-		log.Fatalf("WS write meta: %v", err)
-	}
+	// Send metadata as binary (not text) so VNCHub forwards it
+	// Actually, don't send meta at all — the viewer knows the format.
+	// The VNCHub only forwards BinaryMessage, so text meta would be dropped anyway.
 
 	// Start restream as subprocess
 	// reMarkable 2 firmware 3.3.2: 1bpp gray8, 1872×1404 (landscape), LZ4 compressed
@@ -167,8 +166,11 @@ func main() {
 	// Tail the restream output file and forward data via WebSocket.
 	// restream writes LZ4 frames (with magic 04 22 4D 18) to the file.
 	// We forward chunks; the viewer reassembles LZ4 frames.
-	frameCount := 0
-	totalBytes := 0
+	// Read LZ4-compressed data from the FIFO, decompress, send raw pixel frames.
+	// restream writes ONE continuous LZ4 frame. We use lz4 streaming decompression
+	// to read it, and send complete raw frames (2,628,288 bytes each) over WebSocket.
+	// The viewer renders raw pixels directly — no LZ4 decompression in browser.
+	FRAME_SIZE := 1872 * 1404 // 2,628,288 bytes (1 byte per pixel, 4-bit grayscale)
 
 	// Wait for the read end of the FIFO to open
 	rr := <-readCh
@@ -177,35 +179,36 @@ func main() {
 	}
 	defer rr.f.Close()
 
-	buf := make([]byte, 65536)
+	// Create LZ4 streaming reader over the FIFO
+	lz4Reader := lz4.NewReader(rr.f)
 
+	// Read complete frames and send them
+	frameBuf := make([]byte, FRAME_SIZE)
+	frameCount := 0
 	for {
-		n, err := rr.f.Read(buf)
-		if n > 0 {
-			data := buf[:n]
-			if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, data); wsErr != nil {
-				log.Printf("WS write: %v", wsErr)
-				break
-			}
-			frameCount++
-			totalBytes += n
-			if frameCount%100 == 0 {
-				log.Printf("  streamed %d chunks (total=%d bytes)", frameCount, totalBytes)
-			}
-		}
-		if err == io.EOF {
-			// File is still being written — wait and retry
-			time.Sleep(50 * time.Millisecond)
-			continue
+		_, err := io.ReadFull(lz4Reader, frameBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			log.Printf("LZ4 stream ended after %d frames", frameCount)
+			break
 		}
 		if err != nil {
-			log.Printf("file read: %v", err)
+			log.Printf("LZ4 read: %v", err)
 			break
+		}
+
+		// Send raw pixel frame
+		if wsErr := wsConn.WriteMessage(websocket.BinaryMessage, frameBuf); wsErr != nil {
+			log.Printf("WS write: %v", wsErr)
+			break
+		}
+		frameCount++
+		if frameCount%10 == 0 {
+			log.Printf("  sent %d frames", frameCount)
 		}
 	}
 
 	cmd.Wait()
-	log.Printf("Stream ended: %d chunks, %d bytes", frameCount, totalBytes)
+	log.Printf("Stream ended: %d frames", frameCount)
 }
 
 func readTokenFromConfig() string {
