@@ -448,8 +448,12 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	defer rawFile.Close()
 
 	// RFB -> WebSocket (binary messages)
+	// We accumulate a complete FramebufferUpdate before sending, so each
+	// WebSocket message contains exactly one RFB message. This lets the
+	// VNCHub cache complete frames for late-joining viewers.
 	go func() {
 		buf := make([]byte, 65536)
+		var frameBuf []byte // accumulated current frame
 		for {
 			n, err := rfbConn.Read(buf)
 			if err != nil {
@@ -461,20 +465,130 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			if rawFile != nil {
 				rawFile.Write(buf[:n])
 			}
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				log.Printf("WS write ended: %v", err)
-				done <- struct{}{}
-				return
-			}
-			if totalBytes < 5*1024*1024 { // log first 5MB
-				nonZero := 0
-				for i := 0; i < n; i++ {
-					if buf[i] != 0 {
-						nonZero++
+
+			frameBuf = append(frameBuf, buf[:n]...)
+
+			// Try to extract complete FramebufferUpdate messages from frameBuf.
+			// RFB message types from server:
+			//   0 = FramebufferUpdate
+			//   1 = SetColourMapEntries
+			//   2 = Bell
+			//   3 = ServerCutText
+			// We send each complete message as its own WebSocket message.
+			for len(frameBuf) > 0 {
+				msgType := frameBuf[0]
+				var msgLen int
+				consumed := false
+
+				if msgType == 0 {
+					// FramebufferUpdate: msgType(1) + pad(1) + numRects(2) + rects
+					if len(frameBuf) < 4 {
+						break // need more data
 					}
+					numRects := int(binary.BigEndian.Uint16(frameBuf[2:4]))
+					offset := 4
+					complete := true
+					for r := 0; r < numRects; r++ {
+						if offset+12 > len(frameBuf) {
+							complete = false
+							break
+						}
+						w := int(binary.BigEndian.Uint16(frameBuf[offset+4:offset+6]))
+						h := int(binary.BigEndian.Uint16(frameBuf[offset+6:offset+8]))
+						enc := int32(binary.BigEndian.Uint32(frameBuf[offset+8:offset+12]))
+						offset += 12
+
+						rectLen := 0
+						switch enc {
+						case 0: // RAW
+							rectLen = w * h * int(info.bpp) / 8
+						case 16: // ZRLE
+							if offset+4 > len(frameBuf) {
+								complete = false
+								break
+							}
+							zlibLen := int(binary.BigEndian.Uint32(frameBuf[offset:offset+4]))
+							rectLen = 4 + zlibLen
+						case 5: // HEXTILE — variable, hard to predict. For now treat as raw estimate.
+							rectLen = w * h * int(info.bpp) / 8
+						case -223: // DesktopSize
+							rectLen = 0
+						case -239: // Cursor
+							rectLen = w*h*int(info.bpp)/8 + (w*h+7)/8
+						default:
+							// Unknown encoding — can't compute length, send what we have
+							complete = false
+						}
+						if !complete {
+							break
+						}
+						if offset+rectLen > len(frameBuf) {
+							complete = false
+							break
+						}
+						offset += rectLen
+					}
+					if complete {
+						msgLen = offset
+						consumed = true
+					} else {
+						break // wait for more data
+					}
+				} else if msgType == 1 {
+					// SetColourMapEntries: msgType(1) + pad(1) + firstColour(2) + numColours(2) + colours
+					if len(frameBuf) < 8 {
+						break
+					}
+					numColours := int(binary.BigEndian.Uint16(frameBuf[4:6]))
+					msgLen = 8 + numColours*6
+					if len(frameBuf) < msgLen {
+						break
+					}
+					consumed = true
+				} else if msgType == 2 {
+					// Bell: 1 byte
+					msgLen = 1
+					consumed = true
+				} else if msgType == 3 {
+					// ServerCutText: msgType(1) + pad(3) + length(4) + text
+					if len(frameBuf) < 8 {
+						break
+					}
+					length := int(binary.BigEndian.Uint32(frameBuf[4:8]))
+					msgLen = 8 + length
+					if len(frameBuf) < msgLen {
+						break
+					}
+					consumed = true
+				} else {
+					// Unknown message type — send 1 byte to avoid getting stuck
+					log.Printf("Unknown RFB message type: %d, sending 1 byte", msgType)
+					msgLen = 1
+					consumed = true
 				}
-				log.Printf("  RFB->WS: %d bytes (total=%d), nonZero=%d, first: %x", n, totalBytes, nonZero, buf[:min(n, 16)])
+
+				if consumed {
+					msg := frameBuf[:msgLen]
+					if err := wsConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+						log.Printf("WS write ended: %v", err)
+						done <- struct{}{}
+						return
+					}
+					if totalBytes < 5*1024*1024 && msgType == 0 {
+						nonZero := 0
+						for i := 0; i < len(msg); i++ {
+							if msg[i] != 0 {
+								nonZero++
+							}
+						}
+						log.Printf("  RFB->WS: %d bytes (total=%d), nonZero=%d, first: %x", len(msg), totalBytes, nonZero, msg[:min(len(msg), 16)])
+					}
+					frameBuf = frameBuf[msgLen:]
+				} else {
+					break
+				}
 			}
+
 			// After each read, request incremental update for next frame
 			fbReq[1] = 1 // incremental
 			rfbConn.Write(fbReq)

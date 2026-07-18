@@ -97,18 +97,13 @@ func (h *VNCHub) run() {
 			h.mu.Lock()
 			h.lastMeta = data
 			h.mu.Unlock()
-		} else {
-			// Heuristic: a FramebufferUpdate with a full-screen rect
-			// (1404x1872) is a "full frame" — cache it. Small incremental
-			// updates are NOT cached (they're deltas on top of the
-			// last full frame). We detect full frames by size: the
-			// smallest full ZRLE frame is ~20KB; incremental updates
-			// are typically < 5KB. To be safe, cache any frame > 10KB.
-			if len(data) > 10240 {
-				h.mu.Lock()
-				h.lastFrame = data
-				h.mu.Unlock()
-			}
+		} else if len(data) > 100 {
+			// Each WebSocket message from the proxy is now a complete RFB
+			// FramebufferUpdate (the proxy coalesces). Cache it so new
+			// viewers immediately see the current screen.
+			h.mu.Lock()
+			h.lastFrame = data
+			h.mu.Unlock()
 		}
 
 		h.mu.Lock()
