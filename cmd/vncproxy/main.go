@@ -8,6 +8,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"log"
 	"net"
@@ -138,32 +139,23 @@ func main() {
 					break
 				}
 				// Check if accum starts with LZ4 magic
-				if !(accum[0] == 0x04 && accum[1] == 0x22 && accum[2] == 0x4D && accum[3] == 0x18) {
-					// Find magic in buffer
-					found := false
-					for i := 1; i < len(accum)-3; i++ {
-						if accum[i] == 0x04 && accum[i+1] == 0x22 && accum[i+2] == 0x4D && accum[i+3] == 0x18 {
-							accum = accum[i:]
-							found = true
-							break
-						}
-					}
-					if !found {
+				if !bytes.HasPrefix(accum, []byte{0x04, 0x22, 0x4D, 0x18}) {
+					// Find magic in buffer using bytes.Index (SIMD-optimized)
+					idx := bytes.Index(accum, []byte{0x04, 0x22, 0x4D, 0x18})
+					if idx < 0 {
 						// Keep last 4 bytes (magic may span reads)
 						if len(accum) > 4 {
 							accum = accum[len(accum)-4:]
 						}
 						break
 					}
+					accum = accum[idx:]
 				}
 
-				// Find next magic
-				nextMagic := -1
-				for i := 4; i < len(accum)-3; i++ {
-					if accum[i] == 0x04 && accum[i+1] == 0x22 && accum[i+2] == 0x4D && accum[i+3] == 0x18 {
-						nextMagic = i
-						break
-					}
+				// Find next magic using bytes.Index (search from position 4)
+				nextMagic := bytes.Index(accum[4:], []byte{0x04, 0x22, 0x4D, 0x18})
+				if nextMagic >= 0 {
+					nextMagic += 4
 				}
 
 				if nextMagic < 0 {
