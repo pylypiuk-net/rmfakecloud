@@ -98,11 +98,14 @@ func (h *VNCHub) run() {
 			h.lastMeta = data
 			h.mu.Unlock()
 		} else if len(data) > 100 {
-			// Each WebSocket message from the proxy is now a complete RFB
-			// FramebufferUpdate (the proxy coalesces). Cache it so new
-			// viewers immediately see the current screen.
+			// Each WebSocket message from the proxy is a complete RFB
+			// FramebufferUpdate. Cache the largest frame seen — that's
+			// the full-screen update. Incremental updates are small and
+			// meaningless without the base frame.
 			h.mu.Lock()
-			h.lastFrame = data
+			if h.lastFrame == nil || len(data) > len(h.lastFrame) {
+				h.lastFrame = data
+			}
 			h.mu.Unlock()
 		}
 
