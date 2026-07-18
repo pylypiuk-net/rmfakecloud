@@ -8,6 +8,9 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -18,6 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"crypto/sha256"
+	"golang.org/x/crypto/pbkdf2"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/websocket"
 )
 
@@ -45,10 +51,33 @@ func main() {
 	if deviceToken == "" && len(os.Args) > 1 {
 		deviceToken = os.Args[1]
 	}
+
+	// If the token from xochitl.conf is expired, generate a fresh JWT.
+	// The JWT signing key is PBKDF2(rawSecret, "todo some salt", 10000, 32, sha256).
+	secretStr := os.Getenv("JWT_SECRET_KEY")
+	if secretStr == "" {
+		secretStr = "Nevadastate01!" // default for our deployment
+	}
+
+	// Try to use the token from xochitl.conf, but if it's expired, generate a fresh one
 	if deviceToken == "" {
-		// Try to read from xochitl config
 		deviceToken = readTokenFromConfig()
 	}
+
+	// Check if the token is expired; if so, generate a fresh one
+	if isTokenExpired(deviceToken) && secretStr != "" {
+		log.Printf("Token from config is expired, generating fresh JWT")
+		// Read device info from xochitl.conf
+		deviceID, deviceDesc := readDeviceInfo()
+		freshToken, err := generateJWT(secretStr, deviceID, deviceDesc)
+		if err != nil {
+			log.Printf("Failed to generate JWT: %v", err)
+		} else {
+			deviceToken = freshToken
+			log.Printf("Generated fresh JWT (len=%d)", len(freshToken))
+		}
+	}
+
 	if deviceToken == "" {
 		log.Fatal("no device token provided (set DEVICE_TOKEN or pass as arg)")
 	}
@@ -204,6 +233,103 @@ func readTokenFromConfig() string {
 		}
 	}
 	return ""
+}
+
+// isTokenExpired checks if a JWT token's exp claim is in the past.
+func isTokenExpired(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return true
+	}
+	// Decode the payload (base64url, no padding)
+	payload := parts[1]
+	// Add padding if needed
+	for len(payload)%4 != 0 {
+		payload += "="
+	}
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return true
+	}
+	// Parse JSON to get exp
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return true
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return true
+	}
+	return time.Now().Unix() > int64(exp)
+}
+
+// readDeviceInfo reads the device ID and description from xochitl.conf
+func readDeviceInfo() (string, string) {
+	paths := []string{
+		"/home/root/.config/remarkable/xochitl.conf",
+		"/home/root/.xochitl.conf",
+	}
+	deviceID := ""
+	deviceDesc := "remarkable"
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, "DeviceID=") || strings.Contains(line, "device-id=") {
+				parts := strings.SplitN(line, "=", 2)
+				if len(parts) == 2 {
+					deviceID = strings.Trim(strings.TrimSpace(parts[1]), "@ByteArray()")
+				}
+			}
+		}
+	}
+	if deviceID == "" {
+		deviceID = "RM110-219-91826"
+	}
+	return deviceID, deviceDesc
+}
+
+// generateJWT creates a fresh JWT for device authentication
+func generateJWT(secret, deviceID, deviceDesc string) (string, error) {
+	// Derive signing key using PBKDF2 (same as rmfakecloud)
+	dk := pbkdf2.Key([]byte(secret), []byte("todo some salt"), 10000, 32, sha256.New)
+
+	// Create claims matching the device token format
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"auth0-user-id": "ypyly",
+		"auth0-profile": map[string]interface{}{
+			"UserID":      "ypyly",
+			"IsSocial":    false,
+			"Connection":  "Username-Password-Authentication",
+			"Name":        "ypyly",
+			"Nickname":    "",
+			"GivenName":   "",
+			"FamilyName":  "",
+			"Email":       "ypyly (via https://local.appspot.com)",
+			"EmailVerified": true,
+			"CreatedAt":   "2025-03-29T10:59:55.715945208Z",
+			"UpdatedAt":   "2025-03-29T10:59:55.715945298Z",
+		},
+		"device-desc":  deviceDesc,
+		"device-id":    deviceID,
+		"scopes":       "intgr screenshare docedit sync:tortoises",
+		"version":      10,
+		"level":        "connect",
+		"telectonic":   "eu",
+		"exp":          now.Add(24 * time.Hour).Unix(),
+		"jti":          fmt.Sprintf("%d", now.UnixNano()),
+		"iat":          now.Unix(),
+		"iss":          "rM WebApp",
+		"nbf":          now.Unix(),
+		"sub":          "ypyly",
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = "1"
+	return token.SignedString(dk)
 }
 
 // Unused but kept for reference
