@@ -233,7 +233,7 @@ export default function VNCViewer() {
     const view = new DataView(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength);
     if (pixelData.byteLength < 4) return;
     const zlibLen = view.getUint32(0);
-    console.log('[VNC] ZRLE rect:', x, y, w, h, 'zlibLen:', zlibLen, 'dataLen:', pixelData.byteLength);
+    console.log('[VNC] ZRLE rect:', x, y, w, h, 'zlibLen:', zlibLen, 'dataLen:', pixelData.byteLength, 'first bytes:', Array.from(pixelData.slice(4, 12)).join(','));
     if (4 + zlibLen > pixelData.byteLength) {
       console.warn('[VNC] ZRLE: incomplete zlib data, need', 4 + zlibLen, 'have', pixelData.byteLength);
       return;
@@ -251,7 +251,7 @@ export default function VNCViewer() {
       // FramebufferUpdate as a complete zlib stream (with header + finalization)
       state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), true);
       decompressed = state.zrleInflate.result;
-      console.log('[VNC] ZRLE inflate result:', decompressed ? decompressed.length : 'null', 'bytes, first 8:', decompressed ? Array.from(decompressed.slice(0, 8)).join(',') : 'null');
+      console.log('[VNC] ZRLE inflate result:', decompressed ? decompressed.length : 'null', 'bytes, err:', state.zrleInflate.err, 'msg:', state.zrleInflate.msg, 'first 8:', decompressed ? Array.from(decompressed.slice(0, 8)).join(',') : 'null');
       if (!decompressed || decompressed.length === 0) {
         return; // no output available
       }
