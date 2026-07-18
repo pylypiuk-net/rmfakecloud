@@ -239,27 +239,14 @@ export default function VNCViewer() {
       return;
     }
 
-    // Decompress using persistent ZRLE zlib stream
+    // Decompress — proxy re-encodes each ZRLE frame as a standalone
+    // zlib stream, so we can use pako.inflate() (not persistent Inflate)
     let decompressed;
     try {
-      if (!state.zrleInflate) {
-        state.zrleInflate = new pako.Inflate({ raw: false });
-      }
-      // ZRLE uses a continuous zlib stream. push with sync mode to get
-      // available output without finalizing the stream.
-      // Try finalizing each chunk — the rM VNC server may send each
-      // FramebufferUpdate as a complete zlib stream (with header + finalization)
-      state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), true);
-      decompressed = state.zrleInflate.result;
-      console.log('[VNC] ZRLE inflate result:', decompressed ? decompressed.length : 'null', 'bytes, err:', state.zrleInflate.err, 'msg:', state.zrleInflate.msg, 'first 8:', decompressed ? Array.from(decompressed.slice(0, 8)).join(',') : 'null');
-      if (!decompressed || decompressed.length === 0) {
-        return; // no output available
-      }
-      // Reset for next frame (we finalize each chunk)
-      state.zrleInflate = null;
+      decompressed = pako.inflate(pixelData.slice(4, 4 + zlibLen));
+      console.log('[VNC] ZRLE inflate result:', decompressed.length, 'bytes, first 8:', Array.from(decompressed.slice(0, 8)).join(','));
     } catch (e) {
       console.warn('[VNC] ZRLE inflate failed:', e);
-      state.zrleInflate = null;
       return;
     }
 
