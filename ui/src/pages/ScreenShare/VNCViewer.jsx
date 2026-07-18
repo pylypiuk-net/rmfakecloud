@@ -17,6 +17,8 @@ export default function VNCViewer() {
   const wsRef = useRef(null);
   const streamBufRef = useRef(null);
   const parseStateRef = useRef(null);
+  const manualDisconnectRef = useRef(false);
+  const reconnectRef = useRef(null);
   const [status, setStatus] = useState('disconnected');
   const [error, setError] = useState(null);
   const [stats, setStats] = useState({ frames: 0, bytes: 0 });
@@ -526,6 +528,7 @@ export default function VNCViewer() {
       wsRef.current.close();
       wsRef.current = null;
     }
+    manualDisconnectRef.current = false;
 
     setStatus('connecting');
     setError(null);
@@ -567,20 +570,35 @@ export default function VNCViewer() {
     };
 
     ws.onerror = () => {
-      setError('WebSocket error');
-      setStatus('error');
+      // Don't set error here — onclose will handle reconnection
+      console.warn('[VNC] WebSocket error');
     };
 
     ws.onclose = (e) => {
       setStatus('disconnected');
       if (e.code !== 1000) {
-        setError(`Connection closed (code: ${e.code})`);
+        setError(`Connection lost. Reconnecting...`);
       }
       wsRef.current = null;
+
+      // Auto-reconnect after 2s if we didn't manually disconnect
+      if (!manualDisconnectRef.current) {
+        reconnectRef.current = setTimeout(() => {
+          if (!manualDisconnectRef.current) {
+            console.log('[VNC] Auto-reconnecting...');
+            connectVNC();
+          }
+        }, 2000);
+      }
     };
-  }, [appendData, parseStream, initParser]);
+  }, [appendData, parseStream, initParser, connectVNC]);
 
   const disconnectVNC = useCallback(() => {
+    manualDisconnectRef.current = true;
+    if (reconnectRef.current) {
+      clearTimeout(reconnectRef.current);
+      reconnectRef.current = null;
+    }
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -590,6 +608,10 @@ export default function VNCViewer() {
 
   useEffect(() => {
     return () => {
+      manualDisconnectRef.current = true;
+      if (reconnectRef.current) {
+        clearTimeout(reconnectRef.current);
+      }
       if (wsRef.current) {
         wsRef.current.close();
       }
