@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -75,20 +76,28 @@ func main() {
 	// The 2bpp mode produces tiled output (bytes are duplicated — correlation 1.0 between high/low)
 	// 1bpp with skip=8 produces clean frames. Use restream v1.5.0 (has -s flag).
 	//
-	// IMPORTANT: restream outputs LZ4 frames (magic 04 22 4D 18) when writing to a file,
+	// IMPORTANT: restream outputs LZ4 frames (magic 04 22 4D 18) when writing to a file/FIFO,
 	// but raw data WITHOUT framing when writing to a pipe (stdout pipe). To get LZ4 frames,
-	// we redirect restream's stdout to a temp file and tail it.
+	// we redirect restream's stdout to a named pipe (FIFO) and read from it.
+	fifoPath := "/tmp/restream_fifo"
+	os.Remove(fifoPath)
+	if err := syscall.Mkfifo(fifoPath, 0644); err != nil {
+		log.Fatalf("create FIFO: %v", err)
+	}
+	defer os.Remove(fifoPath)
+
 	cmd := exec.Command(restreamBin, "-w", "1872", "-h", "1404", "-b", "1", "-s", "8", "-f", ":mem:")
 	cmd.Env = []string{"PATH=/opt/bin:/usr/bin:/bin"}
 
-	// Use a temp file for restream output (restream outputs LZ4 frames to files, not pipes)
-	tmpFile := "/tmp/restream_output.raw"
-	outFile, err := os.Create(tmpFile)
+	// Open the FIFO for writing. On Linux, opening a FIFO O_RDWR doesn't block
+	// (unlike O_WRONLY which blocks until a reader opens).
+	fifoWrite, err := os.OpenFile(fifoPath, os.O_RDWR, 0)
 	if err != nil {
-		log.Fatalf("create temp file: %v", err)
+		log.Fatalf("open FIFO for writing: %v", err)
 	}
-	defer outFile.Close()
-	cmd.Stdout = outFile
+	defer fifoWrite.Close()
+	cmd.Stdout = fifoWrite
+
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		log.Fatalf("restream stderr pipe: %v", err)
@@ -116,11 +125,12 @@ func main() {
 	frameCount := 0
 	totalBytes := 0
 
-	// Open the file for reading after restream starts writing to it
-	time.Sleep(500 * time.Millisecond) // give restream time to start
-	f, err := os.Open(tmpFile)
+	// Open the FIFO for reading (this may block if no writer — use the same O_RDWR fd)
+	// Actually we already have the FIFO open O_RDWR, so we can read from the same fd.
+	// But restream writes to it via cmd.Stdout. Let's open a separate read fd.
+	f, err := os.Open(fifoPath)
 	if err != nil {
-		log.Fatalf("open temp file for reading: %v", err)
+		log.Fatalf("open FIFO for reading: %v", err)
 	}
 	defer f.Close()
 
