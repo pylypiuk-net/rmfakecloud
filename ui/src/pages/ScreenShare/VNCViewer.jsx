@@ -354,6 +354,7 @@ export default function VNCViewer() {
     let keepParsing = true;
     while (keepParsing) {
       const buf = streamBufRef.current;
+      console.log('[VNC] parseStream: bufLen=', buf.byteLength, 'gotMeta=', state.gotMeta, 'phase=', state.phase);
 
       if (!state.gotMeta) {
         // Expect RFBF meta header (24 bytes): "RFBF" + width(2) + height(2) +
@@ -487,11 +488,13 @@ export default function VNCViewer() {
           }
 
           if (incomplete) {
+            console.log('[VNC] FramebufferUpdate incomplete, waiting for more data (need more for rect', r, ')');
             keepParsing = false;
             break;
           }
 
           consume(offset);
+          console.log('[VNC] FramebufferUpdate complete, consumed', offset, 'bytes');
           setStats(prev => ({
             frames: prev.frames + 1,
             bytes: prev.bytes + offset,
