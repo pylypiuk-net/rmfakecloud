@@ -422,12 +422,9 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	// Forcing RGB565 was likely the cause of the "all-zeros" issue.
 
 	// Send SetEncodings: message-type=2, padding=0, count=N, encodings
-	// Request multiple encodings like rmview — server picks ZRLE.
+	// Request ONLY RAW encoding — no ZRLE (avoids persistent zlib stream
+	// issues for late-joining viewers). Each RAW frame is self-contained.
 	encodings := []int32{
-		HEXTILE_ENCODING,
-		CORRE_ENCODING,
-		ZRLE_ENCODING,
-		RRE_ENCODING,
 		RAW_ENCODING,
 		PSEUDO_DESKTOPSIZE,
 		PSEUDO_CURSOR,
@@ -816,14 +813,14 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				if consumed {
 					msg := frameBuf[:msgLen]
 
-					// Decompress ZRLE and re-encode as standalone zlib per frame
+					// With RAW encoding (no ZRLE), the message is already
+					// raw pixels — no decompression needed. Forward as-is.
+					// (decodeZRLEInPlace is a no-op for non-ZRLE frames.)
 					if msgType == 0 {
 						decoded := decodeZRLEInPlace(msg, *info)
-						if decoded == nil {
-							frameBuf = frameBuf[msgLen:]
-							continue
+						if decoded != nil {
+							msg = decoded
 						}
-						msg = decoded
 					}
 
 					if err := wsConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
