@@ -15,6 +15,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -439,12 +441,128 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-	// No server-side ZRLE decompression — forward raw ZRLE to the viewer.
-	// The viewer uses persistent pako.Inflate with onData callback.
-	// The rM VNC server resets the zlib stream when screen share is stopped/started,
-	// so the first frame has the 789c zlib header. The browser maintains the
-	// persistent inflate context for subsequent (continuation) frames.
-	// O(1) per frame — no re-decompression, no timeout, no frame boundary issues.
+	// ZRLE decompression: accumulate compressed data, decompress per-frame
+	// with fresh zlib.Reader (O(n²) but capped at MAX_ACCUM frames).
+	// The rM VNC server's zlib stream persists across TCP reconnections and
+	// screen share stop/start — only a tablet reboot resets it. So we can't
+	// rely on getting a 789c header for late-joining viewers.
+	//
+	// Approach: accumulate up to MAX_ACCUM frames of compressed ZRLE data.
+	// Per frame: create fresh zlib.Reader on accumulated buffer, io.ReadAll,
+	// take only the NEW decompressed bytes (subtract prev decompressed len),
+	// re-compress as standalone zlib for the viewer.
+	// After MAX_ACCUM frames: reset accumulator, tell viewer to reset context.
+
+	const MAX_ACCUM = 5
+	type accumState struct {
+		compressed   []byte
+		prevDecLen   int
+		frameCount   int
+	}
+	zrState := &accumState{}
+
+	decodeZRLEFrame := func(zlibData []byte) []byte {
+		zrState.frameCount++
+		zrState.compressed = append(zrState.compressed, zlibData...)
+
+		// Fresh zlib.Reader on full accumulated buffer
+		zr, err := zlib.NewReader(bytes.NewReader(zrState.compressed))
+		if err != nil {
+			// Can't init — likely mid-stream, reset accumulator
+			zrState.compressed = zrState.compressed[:0]
+			zrState.prevDecLen = 0
+			zrState.frameCount = 0
+			return nil
+		}
+		decompressed, _ := io.ReadAll(zr)
+		zr.Close()
+
+		if len(decompressed) <= zrState.prevDecLen {
+			// No new output
+			return nil
+		}
+
+		// Extract only the NEW decompressed bytes
+		newData := decompressed[zrState.prevDecLen:]
+		zrState.prevDecLen = len(decompressed)
+
+		// Reset accumulator after MAX_ACCUM frames to bound O(n²)
+		if zrState.frameCount >= MAX_ACCUM {
+			zrState.compressed = zrState.compressed[:0]
+			zrState.prevDecLen = 0
+			zrState.frameCount = 0
+		}
+
+		// Re-compress as standalone zlib
+		var recompressed bytes.Buffer
+		w := zlib.NewWriter(&recompressed)
+		w.Write(newData)
+		w.Close()
+		out := make([]byte, 4+recompressed.Len())
+		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
+		copy(out[4:], recompressed.Bytes())
+		return out
+	}
+
+	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
+		if len(msg) < 4 {
+			return msg
+		}
+		numRects := int(binary.BigEndian.Uint16(msg[2:4]))
+		offset := 4
+		var out bytes.Buffer
+		out.Write(msg[:4])
+		changed := false
+
+		for r := 0; r < numRects; r++ {
+			if offset+12 > len(msg) {
+				return msg
+			}
+			rectHeader := msg[offset : offset+12]
+			enc := int32(binary.BigEndian.Uint32(rectHeader[8:12]))
+			w := int(binary.BigEndian.Uint16(rectHeader[4:6]))
+			h := int(binary.BigEndian.Uint16(rectHeader[6:8]))
+
+			if enc == 16 { // ZRLE
+				if offset+16 > len(msg) {
+					return msg
+				}
+				zlibLen := int(binary.BigEndian.Uint32(msg[offset+12 : offset+16]))
+				if offset+16+zlibLen > len(msg) {
+					return msg
+				}
+				zlibData := msg[offset+16 : offset+16+zlibLen]
+				newData := decodeZRLEFrame(zlibData)
+				if newData == nil {
+					return nil
+				}
+				newRect := make([]byte, 12+len(newData))
+				copy(newRect[:12], rectHeader)
+				copy(newRect[12:], newData)
+				out.Write(newRect)
+				offset += 16 + zlibLen
+				changed = true
+			} else if enc == 0 { // RAW
+				rectLen := w * h * int(info.bpp) / 8
+				if offset+12+rectLen > len(msg) {
+					return msg
+				}
+				out.Write(msg[offset : offset+12+rectLen])
+				offset += 12 + rectLen
+			} else if enc == -223 { // DesktopSize
+				out.Write(rectHeader)
+				offset += 12
+			} else {
+				out.Write(msg[offset:])
+				break
+			}
+		}
+
+		if !changed {
+			return msg
+		}
+		return out.Bytes()
+	}
 
 	done := make(chan struct{}, 2)
 	totalBytes := 0
@@ -579,6 +697,17 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 
 				if consumed {
 					msg := frameBuf[:msgLen]
+
+					// Decompress ZRLE and re-encode as standalone zlib per frame
+					if msgType == 0 {
+						decoded := decodeZRLEInPlace(msg, *info)
+						if decoded == nil {
+							frameBuf = frameBuf[msgLen:]
+							continue
+						}
+						msg = decoded
+					}
+
 					if err := wsConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
 						log.Printf("WS write ended: %v", err)
 						done <- struct{}{}
