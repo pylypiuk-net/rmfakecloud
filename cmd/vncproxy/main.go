@@ -16,7 +16,6 @@ package main
 
 import (
 	"bytes"
-	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -422,12 +421,12 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	// Forcing RGB565 was likely the cause of the "all-zeros" issue.
 
 	// Send SetEncodings: message-type=2, padding=0, count=N, encodings
-	// Request RAW + ZRLE — let the server pick. ZRLE is preferred by
-	// the rM server, but RAW is available as fallback.
+	// Request HEXTILE first — no zlib, no persistent stream, each frame
+	// is self-contained. ZRLE as fallback only.
 	encodings := []int32{
+		HEXTILE_ENCODING,
 		RAW_ENCODING,
 		ZRLE_ENCODING,
-		HEXTILE_ENCODING,
 		PSEUDO_DESKTOPSIZE,
 		PSEUDO_CURSOR,
 	}
@@ -514,53 +513,13 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-	// ZRLE decompression: unbounded accumulator approach.
-	//
-	// The rM VNC server's zlib stream persists across TCP reconnections
-	// and screen share stop/start. We accumulate ALL compressed data since
-	// the beginning and decompress from scratch each frame with a fresh
-	// zlib.Reader. This is O(n²) but produces correct output — the only
-	// approach that reliably works with the rM VNC server's non-resetting
-	// zlib stream.
-	//
-	// Each frame's decompressed output is re-compressed as a standalone
-	// zlib stream (with 789c header) so the browser can decode it
-	// independently with pako.inflate().
-
-	var accum []byte // accumulated compressed data (grows unbounded)
+		// With HEXTILE encoding, each frame is self-contained — no zlib
+	// stream, no accumulator needed. Forward frames as-is.
+	// (decodeZRLEInPlace handles HEXTILE rect forwarding and is a
+	// no-op for non-ZRLE encodings.)
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		accum = append(accum, zlibData...)
-
-		// Fresh zlib reader over the full accumulated data
-		zr, err := zlib.NewReader(bytes.NewReader(accum))
-		if err != nil {
-			// No zlib header yet — wait for more data
-			return nil
-		}
-		defer zr.Close()
-
-		// Read all decompressed output
-		var decompressed bytes.Buffer
-		_, err = io.Copy(&decompressed, zr)
-		if err != nil {
-			// Incomplete stream — wait for more data
-			return nil
-		}
-
-		if decompressed.Len() == 0 {
-			return nil
-		}
-
-		// Re-compress as standalone zlib
-		var recompressed bytes.Buffer
-		zw := zlib.NewWriter(&recompressed)
-		zw.Write(decompressed.Bytes())
-		zw.Close()
-		out := make([]byte, 4+recompressed.Len())
-		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
-		copy(out[4:], recompressed.Bytes())
-		return out
+		return nil // not used with HEXTILE
 	}
 
 	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
