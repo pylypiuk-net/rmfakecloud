@@ -292,7 +292,7 @@ export default function VNCViewer() {
           // Raw tile
           const tileBytes = tilePixels * bypp;
           if (offset + tileBytes > dv.byteLength) return;
-          const tileData = new Uint8Array(decompressed.buffer, decompressed.byteOffset + offset, tileBytes);
+          const tileData = new Uint8Array(newData.buffer, newData.byteOffset + offset, tileBytes);
           renderRAW(x + tx, y + ty, tw, th, tileData, state);
           offset += tileBytes;
         } else if (subenc === 1) {
