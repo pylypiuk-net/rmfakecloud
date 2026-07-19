@@ -516,16 +516,8 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		// ZRLE decompression: unbounded accumulator.
 	// The rM VNC server hardcodes ZRLE with a persistent zlib stream.
 	// We accumulate ALL compressed data and decompress from scratch each
-	// frame. O(n²) but correct. The first frame after xochitl restart has
-	// the 789c zlib header; subsequent frames are continuation data.
-	//
-	// Optimization: we keep a sliding window of decompressed output. Each
-	// frame, we decompress the full accumulator and take only the NEW
-	// bytes (delta from last frame). This bounds the re-compressed output
-	// to just the new tiles, keeping bandwidth and viewer work O(1).
-
+	// frame, then re-compress as standalone zlib. O(n²) but correct.
 	var accum []byte
-	var lastDecompressedLen int
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
 		accum = append(accum, zlibData...)
@@ -542,19 +534,14 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			return nil
 		}
 
-		if decompressed.Len() == 0 || decompressed.Len() <= lastDecompressedLen {
-			// No new data
+		if decompressed.Len() == 0 {
 			return nil
 		}
-
-		// Take only the new decompressed bytes
-		newData := decompressed.Bytes()[lastDecompressedLen:]
-		lastDecompressedLen = decompressed.Len()
 
 		// Re-compress as standalone zlib
 		var recompressed bytes.Buffer
 		zw := zlib.NewWriter(&recompressed)
-		zw.Write(newData)
+		zw.Write(decompressed.Bytes())
 		zw.Close()
 		out := make([]byte, 4+recompressed.Len())
 		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
