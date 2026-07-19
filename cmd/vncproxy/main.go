@@ -36,31 +36,8 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// nonBlockingBuffer is a thread-safe byte buffer that returns (0, nil)
-// when empty instead of io.EOF, so a zlib reader knows the stream is
-// still open but has no data available yet.
-type nonBlockingBuffer struct {
-	mu   sync.Mutex
-	data []byte
-}
+// nonBlockingBuffer removed — using io.Pipe with goroutine instead.
 
-func (b *nonBlockingBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.data = append(b.data, p...)
-	return len(p), nil
-}
-
-func (b *nonBlockingBuffer) Read(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.data) == 0 {
-		return 0, nil
-	}
-	n := copy(p, b.data)
-	b.data = b.data[n:]
-	return n, nil
-}
 
 // RFB encoding constants
 const (
@@ -553,58 +530,85 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		info.redShift, info.greenShift, info.blueShift)
 		// ZRLE decompression: SERVER-SIDE with persistent streaming decompressor.
 		// The rM VNC server uses a single persistent zlib stream across all
-		// ZRLE rects/frames. We maintain a persistent zlib.Reader that reads
-		// from a non-blocking buffer. Each frame appends new zlib data and
-		// reads the NEW decompressed output. O(1) per frame — no re-decompression.
-		// Each rect's tile data is re-compressed as standalone zlib (789c).
+		// ZRLE rects/frames. We maintain a persistent zlib.Reader reading from
+		// an io.Pipe. A goroutine continuously decompresses and accumulates output.
+		// Each frame writes new zlib data to the pipe, waits briefly for the
+		// decompressor to process it, then reads the NEW accumulated output.
+		// O(1) per frame — no re-decompression. ~5ms latency per frame.
 
-		var streamBuf = &nonBlockingBuffer{}
+		type streamDecompressor struct {
+			pipeW  *io.PipeWriter
+			outMu  sync.Mutex
+			out    []byte
+		}
 
-		var (
-			zr     io.ReadCloser
-			zrMu   sync.Mutex
-			zrInit bool
-		)
+		var sd *streamDecompressor
+
+		initStreamDecompressor := func(firstData []byte) error {
+			pr, pw := io.Pipe()
+			sd = &streamDecompressor{pipeW: pw}
+			go func() {
+				zr, err := zlib.NewReader(pr)
+				if err != nil {
+					log.Printf("zlib init: %v", err)
+					return
+				}
+				buf := make([]byte, 32768)
+				for {
+					n, err := zr.Read(buf)
+					if n > 0 {
+						chunk := make([]byte, n)
+						copy(chunk, buf[:n])
+						sd.outMu.Lock()
+						sd.out = append(sd.out, chunk...)
+						sd.outMu.Unlock()
+					}
+					if err != nil {
+						if err != io.EOF {
+							log.Printf("zlib stream read: %v", err)
+						}
+						return
+					}
+				}
+			}()
+			// Write first chunk to initialize the stream
+			return nil
+		}
+
+		var sdMu sync.Mutex
 
 		decodeZRLEFrame := func(zlibData []byte, w, h int) []byte {
-			zrMu.Lock()
-			defer zrMu.Unlock()
+			sdMu.Lock()
+			defer sdMu.Unlock()
 
-			if !zrInit {
-				// First call: write data, then create zlib reader.
-				// The first bytes must contain the 789c zlib header.
-				streamBuf.Write(zlibData)
-				var err error
-				zr, err = zlib.NewReader(streamBuf)
-				if err != nil {
-					log.Printf("zlib.NewReader failed: %v (first: %x)", err, zlibData[:min(8, len(zlibData))])
+			if sd == nil {
+				if err := initStreamDecompressor(zlibData); err != nil {
 					return nil
 				}
-				zrInit = true
-			} else {
-				// Append new zlib data to the stream buffer
-				streamBuf.Write(zlibData)
 			}
 
-			// Read all available decompressed output.
-			// When the buffer is empty, Read returns (0, nil) and we break.
-			var decompressed []byte
-			tmpBuf := make([]byte, 32768)
-			for {
-				n, readErr := zr.Read(tmpBuf)
-				if n > 0 {
-					decompressed = append(decompressed, tmpBuf[:n]...)
-				}
-				if readErr != nil {
-					if readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
-						log.Printf("zlib read: %v (got %d bytes)", readErr, len(decompressed))
-					}
-					break
-				}
-				if n == 0 {
-					break // no more data available
-				}
+			// Write zlib data to the pipe in a goroutine (non-blocking).
+			// The pipe blocks until the decompressor reads it.
+			writeDone := make(chan struct{})
+			go func() {
+				sd.pipeW.Write(zlibData)
+				close(writeDone)
+			}()
+
+			// Wait briefly for the decompressor to process the data.
+			// 10ms is enough for ARM to decompress a 55KB frame.
+			select {
+			case <-writeDone:
+				time.Sleep(2 * time.Millisecond)
+			case <-time.After(50 * time.Millisecond):
+				// Timeout — decompressor is slow or stalled
 			}
+
+			// Read and clear accumulated decompressed output
+			sd.outMu.Lock()
+			decompressed := sd.out
+			sd.out = nil
+			sd.outMu.Unlock()
 
 			if len(decompressed) == 0 {
 				return nil
