@@ -241,22 +241,28 @@ export default function VNCViewer() {
 
     // ZRLE uses a PERSISTENT zlib stream shared across all rects.
     // Maintain a single pako.Inflate instance in state. Feed each rect's
-    // zlib data to it and take only the NEW decompressed bytes (delta) —
-    // exactly that rect's ZRLE tile data.
+    // zlib data to it and collect the NEW decompressed bytes via onData.
     if (!state.zrleInflate) {
       state.zrleInflate = new pako.Inflate();
       state.zrleOutLen = 0;
+      state.zrleChunks = [];
+      state.zrleInflate.onData = (chunk) => {
+        state.zrleChunks.push(chunk);
+      };
     }
     const inflator = state.zrleInflate;
+    state.zrleChunks = [];
     inflator.push(pixelData.slice(4, 4 + zlibLen), false);
-    const decompressed = inflator.result;
-    if (!decompressed || decompressed.length <= state.zrleOutLen) {
+    if (state.zrleChunks.length === 0) {
       console.warn('[VNC] ZRLE: no new decompressed data');
       return;
     }
-    // Take only the new bytes (this rect's tile data)
-    const newData = decompressed.subarray(state.zrleOutLen);
-    state.zrleOutLen = decompressed.length;
+    // Concatenate all chunks from this push
+    let totalLen = 0;
+    for (const c of state.zrleChunks) totalLen += c.length;
+    const newData = new Uint8Array(totalLen);
+    let off = 0;
+    for (const c of state.zrleChunks) { newData.set(c, off); off += c.length; }
 
     const dv = new DataView(newData.buffer, newData.byteOffset, newData.byteLength);
     const bypp = state.bytesPerPixel;
