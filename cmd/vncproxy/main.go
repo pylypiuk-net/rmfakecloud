@@ -526,91 +526,34 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-		// ZRLE decompression: persistent streaming flate.Reader (O(1) per frame).
-	//
-	// The rM VNC server uses a persistent zlib stream. We use a single
-	// flate.Reader over a blocking chunkReader. A goroutine reads
-	// decompressed output continuously. For each rect, we wait for the
-	// reader to finish the current chunk, then send the FULL decompressed
-	// output (not delta) — the viewer renders the full screen each frame.
-
-	cr := newChunkReader()
-
-	// Accumulated decompressed output
-	var outMu sync.Mutex
-	var output []byte
-
-	// Reader goroutine: reads decompressed output continuously
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		// Skip the 2-byte zlib header (78 9c) if present
-		header := make([]byte, 2)
-		_, err := io.ReadFull(cr, header)
-		if err != nil {
-			return
-		}
-		var fr io.ReadCloser
-		if header[0] == 0x78 {
-			fr = flate.NewReader(cr)
-		} else {
-			fr = flate.NewReader(io.MultiReader(bytes.NewReader(header), cr))
-		}
-		defer fr.Close()
-
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := fr.Read(buf)
-			if n > 0 {
-				outMu.Lock()
-				output = append(output, buf[:n]...)
-				outMu.Unlock()
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Per-rect delta: send only new decompressed bytes for this rect
-	var lastLen int
+		// ZRLE decompression: unbounded accumulator (re-decompress from scratch
+	// each rect). O(n²) but CORRECT — the streaming approach can't split
+	// the persistent DEFLATE stream at rect boundaries.
+	var accum []byte
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		cr.append(zlibData)
-		fed := cr.bytesFed()
+		accum = append(accum, zlibData...)
 
-		// Wait until the reader goroutine has consumed all fed bytes
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			consumed := cr.bytesConsumed()
-			if consumed >= fed {
-				break
-			}
-			if time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(5 * time.Millisecond)
+		// Skip 2-byte zlib header if present
+		accumData := accum
+		if len(accumData) >= 2 && accumData[0] == 0x78 {
+			accumData = accumData[2:]
 		}
 
-		// Take only the NEW decompressed bytes (this rect's tile data)
-		outMu.Lock()
-		currentLen := len(output)
-		var newData []byte
-		if currentLen > lastLen {
-			newData = make([]byte, currentLen-lastLen)
-			copy(newData, output[lastLen:currentLen])
-		}
-		outMu.Unlock()
-		lastLen = currentLen
+		fr := flate.NewReader(bytes.NewReader(accumData))
+		defer fr.Close()
 
-		if len(newData) == 0 {
+		var decompressed bytes.Buffer
+		io.Copy(&decompressed, fr)
+
+		if decompressed.Len() == 0 {
 			return nil
 		}
 
 		// Re-compress as standalone zlib (viewer uses pako.inflate)
 		var recompressed bytes.Buffer
 		zw := zlib.NewWriter(&recompressed)
-		zw.Write(newData)
+		zw.Write(decompressed.Bytes())
 		zw.Close()
 		out := make([]byte, 4+recompressed.Len())
 		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
