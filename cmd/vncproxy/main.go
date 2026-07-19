@@ -596,6 +596,19 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				return nil
 			}
 
+			// Detect new zlib stream (789c header) — full-screen refresh starts a new stream.
+			// Close old decompressor and create a new one.
+			if len(zlibData) >= 2 && zlibData[0] == 0x78 && zlibData[1] == 0x9c && sd != nil && len(sd.out) > 0 {
+				sd.pipeW.Close()
+				sd.outMu.Lock()
+				sd.out = nil
+				sd.outMu.Unlock()
+				sd = nil
+				if err := initStreamDecompressor(); err != nil {
+					return nil
+				}
+			}
+
 			// Record current output length
 			sd.outMu.Lock()
 			prevLen := len(sd.out)
