@@ -36,6 +36,32 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
+// nonBlockingBuffer is a thread-safe byte buffer that returns (0, nil)
+// when empty instead of io.EOF, so a zlib reader knows the stream is
+// still open but has no data available yet.
+type nonBlockingBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *nonBlockingBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.data = append(b.data, p...)
+	return len(p), nil
+}
+
+func (b *nonBlockingBuffer) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.data) == 0 {
+		return 0, nil
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
 // RFB encoding constants
 const (
 	RAW_ENCODING       = 0
@@ -525,31 +551,43 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-		// ZRLE decompression: SERVER-SIDE with persistent accumulator.
+		// ZRLE decompression: SERVER-SIDE with persistent streaming decompressor.
 		// The rM VNC server uses a single persistent zlib stream across all
-		// ZRLE rects/frames. We accumulate all zlib data and re-decompress
-		// from scratch each frame. The decompressed output contains ALL tiles
-		// for ALL rects. We track the byte offset per rect and slice accordingly.
-		// Each rect's tile data is then re-compressed as standalone zlib (789c).
+		// ZRLE rects/frames. We maintain a persistent zlib.Reader that reads
+		// from a non-blocking buffer. Each frame appends new zlib data and
+		// reads the NEW decompressed output. O(1) per frame — no re-decompression.
+		// Each rect's tile data is re-compressed as standalone zlib (789c).
+
+		var streamBuf = &nonBlockingBuffer{}
 
 		var (
-			accumBuf   []byte
-			decompOff  int // offset in decompressed output consumed so far
+			zr     io.ReadCloser
+			zrMu   sync.Mutex
+			zrInit bool
 		)
 
 		decodeZRLEFrame := func(zlibData []byte, w, h int) []byte {
-			// Append this rect's zlib data to the accumulator
-			accumBuf = append(accumBuf, zlibData...)
+			zrMu.Lock()
+			defer zrMu.Unlock()
 
-			// Re-decompress from scratch
-			zr, err := zlib.NewReader(bytes.NewReader(accumBuf))
-			if err != nil {
-				log.Printf("zlib.NewReader failed: %v (accumBuf=%d bytes, first: %x)", err, len(accumBuf), accumBuf[:min(8, len(accumBuf))])
-				return nil
+			if !zrInit {
+				// First call: write data, then create zlib reader.
+				// The first bytes must contain the 789c zlib header.
+				streamBuf.Write(zlibData)
+				var err error
+				zr, err = zlib.NewReader(streamBuf)
+				if err != nil {
+					log.Printf("zlib.NewReader failed: %v (first: %x)", err, zlibData[:min(8, len(zlibData))])
+					return nil
+				}
+				zrInit = true
+			} else {
+				// Append new zlib data to the stream buffer
+				streamBuf.Write(zlibData)
 			}
-			// Read decompressed output. The zlib stream is continuous and never
-			// terminates, so io.ReadAll returns io.ErrUnexpectedEOF. We collect
-			// whatever output was produced before the error.
+
+			// Read all available decompressed output.
+			// When the buffer is empty, Read returns (0, nil) and we break.
 			var decompressed []byte
 			tmpBuf := make([]byte, 32768)
 			for {
@@ -558,32 +596,24 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 					decompressed = append(decompressed, tmpBuf[:n]...)
 				}
 				if readErr != nil {
-					// unexpected EOF is expected — the stream is still open
-					// Any other error is real
-					if readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-						log.Printf("zlib read: %v (got %d bytes so far)", readErr, len(decompressed))
+					if readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+						log.Printf("zlib read: %v (got %d bytes)", readErr, len(decompressed))
 					}
 					break
 				}
+				if n == 0 {
+					break // no more data available
+				}
 			}
-			zr.Close()
 
-			// This rect's tile data starts at decompOff and has a known size.
-			// ZRLE uses 64x64 tiles. Each tile has a 1-byte subencoding + tile data.
-			// The exact size depends on the subencoding, which we don't know without
-			// parsing. So we use the difference between this decompression and the
-			// previous one as this rect's data.
-			if len(decompressed) <= decompOff {
-				// No new data for this rect
+			if len(decompressed) == 0 {
 				return nil
 			}
-			rectData := decompressed[decompOff:]
-			decompOff = len(decompressed)
 
 			// Re-compress as standalone zlib (with 789c header)
 			var recompressed bytes.Buffer
 			zw := zlib.NewWriter(&recompressed)
-			zw.Write(rectData)
+			zw.Write(decompressed)
 			zw.Close()
 
 			// Return with 4-byte length prefix (viewer expects this)
