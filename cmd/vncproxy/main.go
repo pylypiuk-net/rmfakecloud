@@ -570,6 +570,7 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		var out bytes.Buffer
 		out.Write(msg[:4])
 		changed := false
+		zrleRectSeen := false
 
 		for r := 0; r < numRects; r++ {
 			if offset+12 > len(msg) {
@@ -581,6 +582,18 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			h := int(binary.BigEndian.Uint16(rectHeader[6:8]))
 
 			if enc == 16 { // ZRLE
+				// Only decompress the first ZRLE rect per frame.
+				// Subsequent ZRLE rects would get the full accumulated
+				// output again, causing corruption. Skip them.
+				if zrleRectSeen {
+					if offset+16 > len(msg) {
+						return msg
+					}
+					zlibLen := int(binary.BigEndian.Uint32(msg[offset+12 : offset+16]))
+					offset += 16 + zlibLen
+					continue
+				}
+				zrleRectSeen = true
 				if offset+16 > len(msg) {
 					return msg
 				}
