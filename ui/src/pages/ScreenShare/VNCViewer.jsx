@@ -239,17 +239,38 @@ export default function VNCViewer() {
       return;
     }
 
-    // ZRLE: proxy now sends each rect as standalone zlib (with 789c header).
-    // Simple pako.inflate() per rect — no persistent stream needed.
+    // Check for new zlib stream (789c header) — reset persistent inflator
+    const zdata = pixelData.slice(4, 4 + zlibLen);
+    if (zdata.length >= 2 && zdata[0] === 0x78 && zdata[1] === 0x9c) {
+      console.log('[VNC] ZRLE: new zlib stream detected (789c), resetting inflator');
+      state.zrleInflate = null;
+      state.zrleInflatePrevLen = 0;
+    }
+
+    // ZRLE: proxy passes raw zlib data through. The viewer maintains a
+    // persistent pako.Inflate stream — the rM VNC server uses one continuous
+    // zlib stream across all rects/frames. We feed each rect's zlib data
+    // to the persistent inflator and consume the new output.
     let newData;
     try {
-      newData = pako.inflate(pixelData.slice(4, 4 + zlibLen));
+      if (!state.zrleInflate) {
+        state.zrleInflate = new pako.Inflate({ raw: false });
+        state.zrleInflatePrevLen = 0;
+      }
+      const zdata = pixelData.slice(4, 4 + zlibLen);
+      state.zrleInflate.push(zdata, false); // false = not last chunk
+      const allOutput = state.zrleInflate.result;
+      if (allOutput && allOutput.length > state.zrleInflatePrevLen) {
+        newData = allOutput.slice(state.zrleInflatePrevLen);
+        state.zrleInflatePrevLen = allOutput.length;
+      } else {
+        newData = new Uint8Array(0);
+      }
     } catch (e) {
       console.warn('[VNC] ZRLE: inflate failed:', e.message);
       return;
     }
     if (!newData || newData.length === 0) {
-      console.warn('[VNC] ZRLE: no decompressed data');
       return;
     }
 
