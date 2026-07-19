@@ -586,11 +586,20 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			return nil
 		}
 
-		// Give the reader goroutine time to decompress the data.
-		// zr.Read blocks on cr when empty; the reader will process
-		// all available data then block. 20ms is enough for ARM to
-		// decompress ~60KB.
-		time.Sleep(20 * time.Millisecond)
+		// Wait for the reader goroutine to finish processing this
+		// chunk. The reader blocks on cr.Read when no data is left,
+		// so we poll until output stops growing.
+		prevLen := -1
+		for i := 0; i < 50; i++ { // max 50 × 2ms = 100ms
+			time.Sleep(2 * time.Millisecond)
+			outMu.Lock()
+			curLen := len(output)
+			outMu.Unlock()
+			if curLen == prevLen && curLen > 0 {
+				break // output stabilized
+			}
+			prevLen = curLen
+		}
 
 		outMu.Lock()
 		newData := output
