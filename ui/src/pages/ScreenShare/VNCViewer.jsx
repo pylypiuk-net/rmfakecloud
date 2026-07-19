@@ -554,10 +554,16 @@ export default function VNCViewer() {
       const canvas = document.createElement('canvas');
       canvas.width = 1404;
       canvas.height = 1872;
+      // Preserve aspect ratio — don't stretch
       canvas.style.maxWidth = '100%';
       canvas.style.maxHeight = '100%';
+      canvas.style.width = 'auto';
+      canvas.style.height = 'auto';
+      canvas.style.objectFit = 'contain';
       canvas.style.imageRendering = 'pixelated';
       canvas.style.background = '#fff';
+      canvas.style.margin = '0 auto';
+      canvas.style.display = 'block';
       container.appendChild(canvas);
     }
 

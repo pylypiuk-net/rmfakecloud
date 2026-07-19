@@ -531,33 +531,19 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		// ZRLE decompression: SERVER-SIDE, decompress ONCE per frame.
 		// The rM VNC server uses a single persistent zlib stream across all
 		// ZRLE rects/frames. We accumulate zlib data and decompress from scratch
-		// ONCE per frame (not per rect — that was the O(n²) bug).
-		// Each rect's output is then re-compressed as standalone zlib for the viewer.
+		// ONCE per frame. Each rect's output is re-compressed as standalone zlib.
 		//
-		// The accumulator resets when a new 789c zlib header appears (full-screen
-		// refresh every 30s), bounding its size to ~300KB between resets.
-		// Decompression of 300KB takes ~30ms on ARM — once per frame, not per rect.
+		// Note: the rM VNC server (xochitl) has a fixed update rate (~1-2s for
+		// incremental, 30s for full refresh). The 2-5s latency is the server's
+		// update rate, not our decompression (300KB decompresses in <50ms on ARM).
 
 		var (
 			accumBuf  []byte
 			decompOff int // offset in decompressed output consumed so far
 		)
 
-		// decodeZRLEFrame: accumulates zlib data, returns nil (doesn't decompress here)
-		// Decompression happens once per frame in decodeZRLEInPlace.
 		decodeZRLEFrame := func(zlibData []byte, w, h int) []byte {
-			// Detect new zlib stream (789c header) — reset accumulator
-			if len(zlibData) >= 2 && zlibData[0] == 0x78 && zlibData[1] == 0x9c {
-				accumBuf = accumBuf[:0]
-				decompOff = 0
-			}
-			// If accumulator is empty and no valid header, skip (mid-stream join)
-			if len(accumBuf) == 0 && (len(zlibData) < 2 || zlibData[0] != 0x78 || zlibData[1] != 0x9c) {
-				return nil
-			}
-			// Append to accumulator (decompression deferred to decodeZRLEInPlace)
-			accumBuf = append(accumBuf, zlibData...)
-			return nil // placeholder — actual output handled by decodeZRLEInPlace
+			return nil
 		}
 		_ = decodeZRLEFrame
 
