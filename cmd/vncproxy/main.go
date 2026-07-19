@@ -597,6 +597,15 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				if offset+16+zlibLen > len(msg) {
 					return msg
 				}
+				zlibData := msg[offset+16 : offset+16+zlibLen]
+				// Accumulate zlib data (with 789c reset detection)
+				if len(zlibData) >= 2 && zlibData[0] == 0x78 && zlibData[1] == 0x9c {
+					accumBuf = accumBuf[:0]
+					decompOff = 0
+				}
+				if len(accumBuf) > 0 || (len(zlibData) >= 2 && zlibData[0] == 0x78 && zlibData[1] == 0x9c) {
+					accumBuf = append(accumBuf, zlibData...)
+				}
 				rects = append(rects, rectInfo{headerOff: offset, zlibOff: offset + 16, zlibLen: zlibLen, w: w, h: h})
 				offset += 16 + zlibLen
 				changed = true
@@ -620,9 +629,10 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			return msg
 		}
 
-		// Decompress the ENTIRE accumulator ONCE
+		// Not synced yet (no 789c header seen) — skip this frame entirely
 		if len(accumBuf) == 0 {
-			return msg // not synced yet
+			log.Printf("ZRLE: skipping frame (not synced, %d rects)", len(rects))
+			return nil
 		}
 		zr, err := zlib.NewReader(bytes.NewReader(accumBuf))
 		if err != nil {
@@ -818,12 +828,14 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 
 					// With RAW encoding (no ZRLE), the message is already
 					// raw pixels — no decompression needed. Forward as-is.
-					// (decodeZRLEInPlace is a no-op for non-ZRLE frames.)
 					if msgType == 0 {
 						decoded := decodeZRLEInPlace(msg, *info)
-						if decoded != nil {
-							msg = decoded
+						if decoded == nil {
+							// nil = skip this frame (not synced yet)
+							frameBuf = frameBuf[msgLen:]
+							continue
 						}
+						msg = decoded
 					}
 
 					if err := wsConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
