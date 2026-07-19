@@ -235,6 +235,29 @@ func (app *ReactAppWrapper) vncProxyConnectHandler(c *gin.Context) {
 	}
 	defer ws.Close()
 
+	// Set ping/pong deadlines to keep the connection alive through
+	// proxies/load-balancers that idle-timeout after ~10min.
+	ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+	ws.SetPingHandler(func(app string) error {
+		ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return ws.WriteMessage(websocket.PongMessage, []byte(app))
+	})
+	ws.SetPongHandler(func(app string) error {
+		ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return nil
+	})
+
+	// Periodically ping the proxy client to keep the connection alive.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}()
+
 	// Read RFB data from proxy and broadcast to web UI clients
 	for {
 		msgType, data, err := ws.ReadMessage()

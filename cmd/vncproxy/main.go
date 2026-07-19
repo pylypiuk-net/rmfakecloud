@@ -423,6 +423,13 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	defer wsConn.Close()
 	log.Printf("WS connected to %s", wsURL)
 
+	// Respond to pings from the hub to keep the connection alive
+	// (hub pings every 30s to prevent idle timeout).
+	wsConn.SetPongHandler(func(string) error {
+		wsConn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return nil
+	})
+
 	// Send pixel format info to the viewer via VNCHub (as first binary message).
 	// This tells the viewer the bpp, dimensions, and color masks from ServerInit.
 	// Format: 4-byte magic "RFBF" + width(2) + height(2) + bpp(1) + depth(1) +
