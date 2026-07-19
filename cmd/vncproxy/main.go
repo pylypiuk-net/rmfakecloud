@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -421,12 +422,11 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	// Forcing RGB565 was likely the cause of the "all-zeros" issue.
 
 	// Send SetEncodings: message-type=2, padding=0, count=N, encodings
-	// Request HEXTILE first — no zlib, no persistent stream, each frame
-	// is self-contained. ZRLE as fallback only.
+	// The rM VNC server hardcodes ZRLE regardless of client preference.
 	encodings := []int32{
+		ZRLE_ENCODING,
 		HEXTILE_ENCODING,
 		RAW_ENCODING,
-		ZRLE_ENCODING,
 		PSEUDO_DESKTOPSIZE,
 		PSEUDO_CURSOR,
 	}
@@ -513,13 +513,53 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-		// With HEXTILE encoding, each frame is self-contained — no zlib
-	// stream, no accumulator needed. Forward frames as-is.
-	// (decodeZRLEInPlace handles HEXTILE rect forwarding and is a
-	// no-op for non-ZRLE encodings.)
+		// ZRLE decompression: unbounded accumulator.
+	// The rM VNC server hardcodes ZRLE with a persistent zlib stream.
+	// We accumulate ALL compressed data and decompress from scratch each
+	// frame. O(n²) but correct. The first frame after xochitl restart has
+	// the 789c zlib header; subsequent frames are continuation data.
+	//
+	// Optimization: we keep a sliding window of decompressed output. Each
+	// frame, we decompress the full accumulator and take only the NEW
+	// bytes (delta from last frame). This bounds the re-compressed output
+	// to just the new tiles, keeping bandwidth and viewer work O(1).
+
+	var accum []byte
+	var lastDecompressedLen int
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		return nil // not used with HEXTILE
+		accum = append(accum, zlibData...)
+
+		zr, err := zlib.NewReader(bytes.NewReader(accum))
+		if err != nil {
+			return nil
+		}
+		defer zr.Close()
+
+		var decompressed bytes.Buffer
+		_, err = io.Copy(&decompressed, zr)
+		if err != nil {
+			return nil
+		}
+
+		if decompressed.Len() == 0 || decompressed.Len() <= lastDecompressedLen {
+			// No new data
+			return nil
+		}
+
+		// Take only the new decompressed bytes
+		newData := decompressed.Bytes()[lastDecompressedLen:]
+		lastDecompressedLen = decompressed.Len()
+
+		// Re-compress as standalone zlib
+		var recompressed bytes.Buffer
+		zw := zlib.NewWriter(&recompressed)
+		zw.Write(newData)
+		zw.Close()
+		out := make([]byte, 4+recompressed.Len())
+		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
+		copy(out[4:], recompressed.Bytes())
+		return out
 	}
 
 	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
