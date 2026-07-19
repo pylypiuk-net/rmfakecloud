@@ -531,9 +531,12 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		// stream state and can correctly split decompressed output by rect.
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		// Forward raw bytes unchanged. The viewer's persistent pako.Inflate
-		// handles the zlib stream and per-rect splitting.
-		return zlibData
+		// Forward raw bytes with 4-byte length prefix (viewer expects this format).
+		// The viewer's persistent pako.Inflate handles the zlib stream and per-rect splitting.
+		out := make([]byte, 4+len(zlibData))
+		binary.BigEndian.PutUint32(out[:4], uint32(len(zlibData)))
+		copy(out[4:], zlibData)
+		return out
 	}
 
 	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
