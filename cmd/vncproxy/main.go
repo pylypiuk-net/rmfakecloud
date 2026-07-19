@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
@@ -522,19 +523,22 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	decodeZRLEFrame := func(zlibData []byte) []byte {
 		accum = append(accum, zlibData...)
 
-		zr, err := zlib.NewReader(bytes.NewReader(accum))
-		if err != nil {
-			log.Printf("ZRLE: zlib.NewReader failed: %v, accum=%d", err, len(accum))
-			return nil
+		// The rM VNC server uses a persistent zlib stream. The first frame
+		// has a 2-byte zlib header (78 9c), subsequent frames are raw DEFLATE
+		// continuation. The stream never sends a final checksum (no EOF).
+		// Use flate.NewReader (raw DEFLATE) and skip the zlib header.
+		accumData := accum
+		if len(accumData) >= 2 && accumData[0] == 0x78 {
+			// Skip 2-byte zlib header
+			accumData = accumData[2:]
 		}
-		defer zr.Close()
+
+		fr := flate.NewReader(bytes.NewReader(accumData))
+		defer fr.Close()
 
 		var decompressed bytes.Buffer
-		_, err = io.Copy(&decompressed, zr)
-		if err != nil {
-			log.Printf("ZRLE: io.Copy failed: %v, accum=%d", err, len(accum))
-			return nil
-		}
+		// Read as much as possible — ignore EOF (stream never ends cleanly)
+		io.Copy(&decompressed, fr)
 
 		if decompressed.Len() == 0 {
 			log.Printf("ZRLE: decompressed 0 bytes, accum=%d", len(accum))
