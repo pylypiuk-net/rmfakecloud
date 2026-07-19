@@ -543,11 +543,12 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	var outMu sync.Mutex
 	var output []byte
 
+	readerStart := make(chan struct{})
 	readerStarted := make(chan struct{})
 	go func() {
 		defer close(readerStarted)
 		// Wait for zr to be initialized
-		<-readerStarted
+		<-readerStart
 		if !zrOK {
 			return
 		}
@@ -580,7 +581,7 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				return
 			}
 			zrOK = true
-			close(readerStarted) // start the reader goroutine
+			close(readerStart) // start the reader goroutine
 		})
 		if !zrOK {
 			return nil
