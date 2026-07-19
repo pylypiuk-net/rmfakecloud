@@ -176,6 +176,18 @@ func main() {
 		connected = true
 		mu.Unlock()
 
+		// Refresh JWT if expired (tokens expire after ~25h)
+		if isJWTExpired(deviceToken) {
+			log.Printf("Device token expired, generating fresh JWT...")
+			newToken, err := generateFreshJWT()
+			if err != nil {
+				log.Printf("JWT generation failed: %v, using expired token", err)
+			} else {
+				deviceToken = newToken
+				log.Printf("Generated fresh JWT")
+			}
+		}
+
 		// Send SetEncodings + FramebufferUpdateRequest, then pipe to server
 		pipeRFBStream(tlsConn, serverHost, serverPort, deviceToken, serverInfo)
 
