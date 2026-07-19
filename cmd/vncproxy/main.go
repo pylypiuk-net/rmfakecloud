@@ -524,6 +524,7 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 
 		zr, err := zlib.NewReader(bytes.NewReader(accum))
 		if err != nil {
+			log.Printf("ZRLE: zlib.NewReader failed: %v, accum=%d", err, len(accum))
 			return nil
 		}
 		defer zr.Close()
@@ -531,12 +532,15 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		var decompressed bytes.Buffer
 		_, err = io.Copy(&decompressed, zr)
 		if err != nil {
+			log.Printf("ZRLE: io.Copy failed: %v, accum=%d", err, len(accum))
 			return nil
 		}
 
 		if decompressed.Len() == 0 {
+			log.Printf("ZRLE: decompressed 0 bytes, accum=%d", len(accum))
 			return nil
 		}
+		log.Printf("ZRLE: decompressed %d bytes from accum=%d", decompressed.Len(), len(accum))
 
 		// Re-compress as standalone zlib
 		var recompressed bytes.Buffer
