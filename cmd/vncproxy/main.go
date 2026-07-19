@@ -198,6 +198,46 @@ func main() {
 		mu.Lock()
 		connected = false
 		mu.Unlock()
+
+		// Auto-reconnect: the rM VNC server drops connections after ~6 min.
+		// Instead of waiting for a new broadcast (which requires the user to
+		// restart screen share on the tablet), reconnect immediately.
+		// The tablet's VNC server should still be running and will accept
+		// a new VNC client connection.
+		log.Printf("VNC disconnected, auto-reconnecting in 2s...")
+		time.Sleep(2 * time.Second)
+
+		// Reconnect to the same RFB server
+		tlsConn2, err := tls.Dial("tcp", rfbAddr, &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			log.Printf("Auto-reconnect RFB failed: %v, waiting for broadcast", err)
+			continue
+		}
+		// Re-do handshake with a fresh challenge
+		userIDHash2 := sha256.Sum256([]byte(userID))
+		// Need a fresh timestamp from the server — use current time
+		ts2 := make([]byte, 8)
+		binary.BigEndian.PutUint64(ts2, uint64(time.Now().UnixNano()))
+		challengeInput2 := append(ts2, userIDHash2[:]...)
+		challenge2 := sha256.Sum256(challengeInput2)
+
+		serverInfo2, err := rfbHandshake(tlsConn2, challenge2[:])
+		if err != nil {
+			log.Printf("Auto-reconnect handshake failed: %v, waiting for broadcast", err)
+			tlsConn2.Close()
+			continue
+		}
+		log.Printf("Auto-reconnect OK! FB: %dx%d", serverInfo2.width, serverInfo2.height)
+
+		mu.Lock()
+		connected = true
+		mu.Unlock()
+
+		pipeRFBStream(tlsConn2, serverHost, serverPort, deviceToken, serverInfo2)
+
+		mu.Lock()
+		connected = false
+		mu.Unlock()
 		log.Printf("Ready for next broadcast...")
 		}
 }

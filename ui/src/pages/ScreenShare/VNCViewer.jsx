@@ -554,12 +554,12 @@ export default function VNCViewer() {
       const canvas = document.createElement('canvas');
       canvas.width = 1404;
       canvas.height = 1872;
-      // Preserve aspect ratio — don't stretch
+      // Preserve aspect ratio — CSS aspect-ratio property ensures the
+      // canvas element is scaled proportionally when fitting the container.
       canvas.style.maxWidth = '100%';
       canvas.style.maxHeight = '100%';
-      canvas.style.width = 'auto';
-      canvas.style.height = 'auto';
-      canvas.style.objectFit = 'contain';
+      canvas.style.aspectRatio = '1404 / 1872';
+      canvas.style.height = 'auto'; // width-driven scaling
       canvas.style.imageRendering = 'pixelated';
       canvas.style.background = '#fff';
       canvas.style.margin = '0 auto';
