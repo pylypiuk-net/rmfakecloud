@@ -572,6 +572,9 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		}
 	}()
 
+	// Per-rect delta: send only new decompressed bytes for this rect
+	var lastLen int
+
 	decodeZRLEFrame := func(zlibData []byte) []byte {
 		cr.append(zlibData)
 		fed := cr.bytesFed()
@@ -589,19 +592,25 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			time.Sleep(5 * time.Millisecond)
 		}
 
+		// Take only the NEW decompressed bytes (this rect's tile data)
 		outMu.Lock()
-		currentOutput := make([]byte, len(output))
-		copy(currentOutput, output)
+		currentLen := len(output)
+		var newData []byte
+		if currentLen > lastLen {
+			newData = make([]byte, currentLen-lastLen)
+			copy(newData, output[lastLen:currentLen])
+		}
 		outMu.Unlock()
+		lastLen = currentLen
 
-		if len(currentOutput) == 0 {
+		if len(newData) == 0 {
 			return nil
 		}
 
 		// Re-compress as standalone zlib (viewer uses pako.inflate)
 		var recompressed bytes.Buffer
 		zw := zlib.NewWriter(&recompressed)
-		zw.Write(currentOutput)
+		zw.Write(newData)
 		zw.Close()
 		out := make([]byte, 4+recompressed.Len())
 		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
