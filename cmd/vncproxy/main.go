@@ -547,12 +547,26 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 				log.Printf("zlib.NewReader failed: %v (accumBuf=%d bytes, first: %x)", err, len(accumBuf), accumBuf[:min(8, len(accumBuf))])
 				return nil
 			}
-			decompressed, err := io.ReadAll(zr)
-			zr.Close()
-			if err != nil {
-				log.Printf("zlib read failed: %v", err)
-				return nil
+			// Read decompressed output. The zlib stream is continuous and never
+			// terminates, so io.ReadAll returns io.ErrUnexpectedEOF. We collect
+			// whatever output was produced before the error.
+			var decompressed []byte
+			tmpBuf := make([]byte, 32768)
+			for {
+				n, readErr := zr.Read(tmpBuf)
+				if n > 0 {
+					decompressed = append(decompressed, tmpBuf[:n]...)
+				}
+				if readErr != nil {
+					// unexpected EOF is expected — the stream is still open
+					// Any other error is real
+					if readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+						log.Printf("zlib read: %v (got %d bytes so far)", readErr, len(decompressed))
+					}
+					break
+				}
 			}
+			zr.Close()
 
 			// This rect's tile data starts at decompOff and has a known size.
 			// ZRLE uses 64x64 tiles. Each tile has a 1-byte subencoding + tile data.
