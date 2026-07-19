@@ -505,18 +505,31 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 
 	cr := &chunkReader{}
 
-	zr, zrErr := zlib.NewReader(cr)
-	if zrErr != nil {
-		log.Printf("ZRLE: failed to create zlib reader: %v", zrErr)
-		return
-	}
-	defer zr.Close()
+	// Lazily create the zlib reader on the first frame, when we
+	// actually have data (the zlib header). zlib.NewReader blocks
+	// until it can read the 2-byte header.
+	var zr io.ReadCloser
+	var zrOnce sync.Once
+	var zrErr error
+	var zrOK bool
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
 		// Append compressed data to the chunkReader
 		cr.mu.Lock()
 		cr.data = append(cr.data, zlibData...)
 		cr.mu.Unlock()
+
+		zrOnce.Do(func() {
+			zr, zrErr = zlib.NewReader(cr)
+			if zrErr != nil {
+				log.Printf("ZRLE: failed to create zlib reader: %v", zrErr)
+				return
+			}
+			zrOK = true
+		})
+		if !zrOK {
+			return nil
+		}
 
 		// Read all available decompressed output. zr.Read returns
 		// (0, nil) when the chunkReader is empty (no more data).
