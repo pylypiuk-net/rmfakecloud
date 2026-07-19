@@ -15,8 +15,6 @@
 package main
 
 import (
-	"bytes"
-	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -441,111 +439,11 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-	// ZRLE decompression: the rM VNC server uses a single continuous zlib
-	// stream. We accumulate all compressed chunks and create a fresh
-	// zlib.Reader per frame. Each reader decompresses from the start, so
-	// we get the full output and take only the new bytes (since last frame).
-	// O(n) memory for compressed data, but simple and correct.
-	var zrChunks [][]byte // accumulated compressed ZRLE chunks
-	var zrPrevLen int     // previous total decompressed length
-
-	decodeZRLEFrameV2 := func(zlibData []byte) []byte {
-		zrChunks = append(zrChunks, zlibData)
-
-		// Build full compressed buffer from all chunks
-		var full bytes.Buffer
-		for _, c := range zrChunks {
-			full.Write(c)
-		}
-
-		// Fresh zlib reader
-		zr, err := zlib.NewReader(&full)
-		if err != nil {
-			log.Printf("  ZRLE NewReader error: %v", err)
-			return nil
-		}
-		decompressed, _ := io.ReadAll(zr)
-		zr.Close()
-
-		// Take only new bytes
-		if len(decompressed) <= zrPrevLen {
-			// No new data
-			return nil
-		}
-		newData := decompressed[zrPrevLen:]
-		zrPrevLen = len(decompressed)
-
-		// Re-compress as standalone zlib
-		var recompressed bytes.Buffer
-		w := zlib.NewWriter(&recompressed)
-		w.Write(newData)
-		w.Close()
-		out := make([]byte, 4+recompressed.Len())
-		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
-		copy(out[4:], recompressed.Bytes())
-		return out
-	}
-
-	// decodeZRLEInPlace: finds ZRLE rects, decompresses, rebuilds message
-	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
-		if len(msg) < 4 {
-			return msg
-		}
-		numRects := int(binary.BigEndian.Uint16(msg[2:4]))
-		offset := 4
-		var out bytes.Buffer
-		out.Write(msg[:4])
-		changed := false
-
-		for r := 0; r < numRects; r++ {
-			if offset+12 > len(msg) {
-				return msg
-			}
-			rectHeader := msg[offset : offset+12]
-			enc := int32(binary.BigEndian.Uint32(rectHeader[8:12]))
-			w := int(binary.BigEndian.Uint16(rectHeader[4:6]))
-			h := int(binary.BigEndian.Uint16(rectHeader[6:8]))
-
-			if enc == 16 { // ZRLE
-				if offset+16 > len(msg) {
-					return msg
-				}
-				zlibLen := int(binary.BigEndian.Uint32(msg[offset+12 : offset+16]))
-				if offset+16+zlibLen > len(msg) {
-					return msg
-				}
-				zlibData := msg[offset+16 : offset+16+zlibLen]
-				newData := decodeZRLEFrameV2(zlibData)
-				if newData == nil {
-					return nil
-				}
-				newRect := make([]byte, 12+len(newData))
-				copy(newRect[:12], rectHeader)
-				copy(newRect[12:], newData)
-				out.Write(newRect)
-				offset += 16 + zlibLen
-				changed = true
-			} else if enc == 0 { // RAW
-				rectLen := w * h * int(info.bpp) / 8
-				if offset+12+rectLen > len(msg) {
-					return msg
-				}
-				out.Write(msg[offset : offset+12+rectLen])
-				offset += 12 + rectLen
-			} else if enc == -223 { // DesktopSize
-				out.Write(rectHeader)
-				offset += 12
-			} else {
-				out.Write(msg[offset:])
-				break
-			}
-		}
-
-		if !changed {
-			return msg
-		}
-		return out.Bytes()
-	}
+	// No server-side ZRLE decompression — forward raw ZRLE to the viewer.
+	// The viewer maintains a persistent pako.Inflate with onData callback.
+	// The rM VNC server uses a continuous zlib stream; the persistent Inflate
+	// context handles this correctly (O(n) — no re-decompression).
+	// Late joiners: proxy reconnects VNC every 30s for a fresh zlib stream.
 
 	done := make(chan struct{}, 2)
 	totalBytes := 0
@@ -680,17 +578,6 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 
 				if consumed {
 					msg := frameBuf[:msgLen]
-
-					// Decompress ZRLE and re-encode as standalone zlib per frame
-					if msgType == 0 {
-						decoded := decodeZRLEInPlace(msg, *info)
-						if decoded == nil {
-							frameBuf = frameBuf[msgLen:]
-							continue
-						}
-						msg = decoded
-					}
-
 					if err := wsConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
 						log.Printf("WS write ended: %v", err)
 						done <- struct{}{}
