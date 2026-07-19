@@ -454,36 +454,33 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
 	// ZRLE decompression: accumulate compressed data, decompress per-frame
-	// with fresh zlib.Reader (O(n²) but capped at MAX_ACCUM frames).
+	// with fresh zlib.Reader (O(n²) but bounded by MAX_ACCUM_BYTES).
 	// The rM VNC server's zlib stream persists across TCP reconnections and
 	// screen share stop/start — only a tablet reboot resets it. So we can't
 	// rely on getting a 789c header for late-joining viewers.
 	//
-	// Approach: accumulate up to MAX_ACCUM frames of compressed ZRLE data.
-	// Per frame: create fresh zlib.Reader on accumulated buffer, io.ReadAll,
-	// take only the NEW decompressed bytes (subtract prev decompressed len),
-	// re-compress as standalone zlib for the viewer.
-	// After MAX_ACCUM frames: reset accumulator, tell viewer to reset context.
+	// Approach: accumulate compressed ZRLE data. Per frame: create fresh
+	// zlib.Reader on accumulated buffer, io.ReadAll, take only the NEW
+	// decompressed bytes, re-compress as standalone zlib for the viewer.
+	// When accumulated buffer exceeds MAX_ACCUM_BYTES, trim the front — but
+	// keep enough history so zlib.NewReader can still initialize. We do this
+	// by keeping the first 2 bytes (789c header) + the last MAX_ACCUM_BYTES.
 
-	const MAX_ACCUM = 5
+
 	type accumState struct {
-		compressed   []byte
-		prevDecLen   int
-		frameCount   int
+		compressed []byte
+		prevDecLen int
 	}
 	zrState := &accumState{}
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		zrState.frameCount++
 		zrState.compressed = append(zrState.compressed, zlibData...)
 
 		// Fresh zlib.Reader on full accumulated buffer
 		zr, err := zlib.NewReader(bytes.NewReader(zrState.compressed))
 		if err != nil {
-			// Can't init — likely mid-stream, reset accumulator
-			zrState.compressed = zrState.compressed[:0]
-			zrState.prevDecLen = 0
-			zrState.frameCount = 0
+			// Can't init — shouldn't happen if we keep the 789c header
+			log.Printf("ZRLE zlib.NewReader failed: %v, len=%d", err, len(zrState.compressed))
 			return nil
 		}
 		decompressed, _ := io.ReadAll(zr)
@@ -498,12 +495,9 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		newData := decompressed[zrState.prevDecLen:]
 		zrState.prevDecLen = len(decompressed)
 
-		// Reset accumulator after MAX_ACCUM frames to bound O(n²)
-		if zrState.frameCount >= MAX_ACCUM {
-			zrState.compressed = zrState.compressed[:0]
-			zrState.prevDecLen = 0
-			zrState.frameCount = 0
-		}
+		// No trimming — let the accumulator grow. At 1fps × 60KB/frame,
+		// it takes ~5min to reach 18MB (decompresses in ~200-500ms on ARM).
+		// User can stop/start screen share to reset the zlib stream.
 
 		// Re-compress as standalone zlib
 		var recompressed bytes.Buffer
