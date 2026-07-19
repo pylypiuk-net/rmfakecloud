@@ -422,10 +422,12 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	// Forcing RGB565 was likely the cause of the "all-zeros" issue.
 
 	// Send SetEncodings: message-type=2, padding=0, count=N, encodings
-	// Request ONLY RAW encoding — no ZRLE (avoids persistent zlib stream
-	// issues for late-joining viewers). Each RAW frame is self-contained.
+	// Request RAW + ZRLE — let the server pick. ZRLE is preferred by
+	// the rM server, but RAW is available as fallback.
 	encodings := []int32{
 		RAW_ENCODING,
+		ZRLE_ENCODING,
+		HEXTILE_ENCODING,
 		PSEUDO_DESKTOPSIZE,
 		PSEUDO_CURSOR,
 	}
