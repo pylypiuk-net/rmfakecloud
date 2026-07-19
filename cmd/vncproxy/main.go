@@ -514,106 +514,48 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-	// ZRLE decompression: persistent streaming decompressor.
+	// ZRLE decompression: unbounded accumulator approach.
 	//
 	// The rM VNC server's zlib stream persists across TCP reconnections
-	// and screen share stop/start. We maintain a single zlib.Reader over
-	// a custom chunkReader that returns (0, nil) when empty (not io.EOF,
-	// not blocking). This lets us call zr.Read in a loop and stop when
-	// no more data is available — O(n) per frame, ~5ms latency regardless
-	// of session length.
+	// and screen share stop/start. We accumulate ALL compressed data since
+	// the beginning and decompress from scratch each frame with a fresh
+	// zlib.Reader. This is O(n²) but produces correct output — the only
+	// approach that reliably works with the rM VNC server's non-resetting
+	// zlib stream.
 	//
 	// Each frame's decompressed output is re-compressed as a standalone
 	// zlib stream (with 789c header) so the browser can decode it
 	// independently with pako.inflate().
 
-	cr := newChunkReader()
-	defer cr.close()
-
-	// Persistent streaming decompressor: reader goroutine reads from
-	// zr (which blocks on cr when empty), accumulates decompressed
-	// output into a shared buffer. feed() appends data, waits for
-	// the reader to produce output, then takes it.
-	var zr io.ReadCloser
-	var zrOK bool
-	var zrInitErr error
-	var zrInitOnce sync.Once
-
-	var outMu sync.Mutex
-	var output []byte
-
-	readerStart := make(chan struct{})
-	readerStarted := make(chan struct{})
-	go func() {
-		defer close(readerStarted)
-		// Wait for zr to be initialized
-		<-readerStart
-		if !zrOK {
-			return
-		}
-		chunk := make([]byte, 64*1024)
-		for {
-			n, err := zr.Read(chunk)
-			if n > 0 {
-				outMu.Lock()
-				output = append(output, chunk[:n]...)
-				outMu.Unlock()
-			}
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("ZRLE reader: %v", err)
-				}
-				return
-			}
-			// zr.Read blocks on cr when empty — we'll wake up
-			// when feed() appends more data.
-		}
-	}()
+	var accum []byte // accumulated compressed data (grows unbounded)
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		cr.append(zlibData)
+		accum = append(accum, zlibData...)
 
-		zrInitOnce.Do(func() {
-			zr, zrInitErr = zlib.NewReader(cr)
-			if zrInitErr != nil {
-				log.Printf("ZRLE: failed to create zlib reader: %v", zrInitErr)
-				return
-			}
-			zrOK = true
-			close(readerStart) // start the reader goroutine
-		})
-		if !zrOK {
+		// Fresh zlib reader over the full accumulated data
+		zr, err := zlib.NewReader(bytes.NewReader(accum))
+		if err != nil {
+			// No zlib header yet — wait for more data
+			return nil
+		}
+		defer zr.Close()
+
+		// Read all decompressed output
+		var decompressed bytes.Buffer
+		_, err = io.Copy(&decompressed, zr)
+		if err != nil {
+			// Incomplete stream — wait for more data
 			return nil
 		}
 
-		// Wait for the reader goroutine to finish processing this
-		// chunk. The reader blocks on cr.Read when no data is left,
-		// so we poll until output stops growing.
-		prevLen := -1
-		for i := 0; i < 50; i++ { // max 50 × 2ms = 100ms
-			time.Sleep(2 * time.Millisecond)
-			outMu.Lock()
-			curLen := len(output)
-			outMu.Unlock()
-			if curLen == prevLen && curLen > 0 {
-				break // output stabilized
-			}
-			prevLen = curLen
-		}
-
-		outMu.Lock()
-		newData := output
-		output = nil
-		outMu.Unlock()
-
-		if len(newData) == 0 {
+		if decompressed.Len() == 0 {
 			return nil
 		}
 
 		// Re-compress as standalone zlib
 		var recompressed bytes.Buffer
 		zw := zlib.NewWriter(&recompressed)
-		zw.Write(newData)
+		zw.Write(decompressed.Bytes())
 		zw.Close()
 		out := make([]byte, 4+recompressed.Len())
 		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
