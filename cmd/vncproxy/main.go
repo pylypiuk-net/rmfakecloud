@@ -528,58 +528,100 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-		// ZRLE decompression: SERVER-SIDE with accumulator that resets on full-screen updates.
+		// ZRLE decompression: SERVER-SIDE with persistent streaming decompressor.
 		// The rM VNC server uses a single persistent zlib stream across all
-		// ZRLE rects/frames. We accumulate zlib data and re-decompress from scratch
-		// each frame. To bound latency, we reset the accumulator when we see a
-		// full-screen rect (0,0,1404,1872) — the 30s periodic full refresh.
-		// This keeps the accumulator small (~5-10 frames worth, ~300KB max).
+		// ZRLE rects/frames. We maintain a persistent zlib.Reader reading from
+		// an io.Pipe. A goroutine continuously decompresses and appends to an
+		// output buffer. For each rect, we:
+		// 1. Record the current output length
+		// 2. Feed the rect's zlib data to the pipe (blocks until consumed)
+		// 3. Read the new output (output[prevLen:]) — this rect's tile data
+		// 4. Re-compress as standalone zlib for the viewer
+		// O(n) total decompression, O(1) per rect. ~5ms latency.
 
-		var (
-			accumBuf  []byte
-			decompOff int // offset in decompressed output consumed so far
-		)
+		type streamDecompressor struct {
+			pipeW  *io.PipeWriter
+			outMu  sync.Mutex
+			out    []byte
+			closed bool
+		}
+
+		var sd *streamDecompressor
+		var sdMu sync.Mutex
+
+		initStreamDecompressor := func() error {
+			pr, pw := io.Pipe()
+			sd = &streamDecompressor{pipeW: pw}
+			go func() {
+				zr, err := zlib.NewReader(pr)
+				if err != nil {
+					log.Printf("zlib init: %v", err)
+					return
+				}
+				buf := make([]byte, 32768)
+				for {
+					n, err := zr.Read(buf)
+					if n > 0 {
+						chunk := make([]byte, n)
+						copy(chunk, buf[:n])
+						sd.outMu.Lock()
+						sd.out = append(sd.out, chunk...)
+						sd.outMu.Unlock()
+					}
+					if err != nil {
+						if err != io.EOF {
+							log.Printf("zlib stream read: %v", err)
+						}
+						return
+					}
+				}
+			}()
+			// Wait briefly for zlib initialization
+			time.Sleep(5 * time.Millisecond)
+			return nil
+		}
 
 		decodeZRLEFrame := func(zlibData []byte, w, h int) []byte {
-			// Reset accumulator on full-screen update (starts a new zlib context window)
-			if w == int(info.width) && h == int(info.height) {
-				accumBuf = accumBuf[:0]
-				decompOff = 0
-			}
+			sdMu.Lock()
+			defer sdMu.Unlock()
 
-			// Append this rect's zlib data to the accumulator
-			accumBuf = append(accumBuf, zlibData...)
-
-			// Re-decompress from scratch
-			zr, err := zlib.NewReader(bytes.NewReader(accumBuf))
-			if err != nil {
-				log.Printf("zlib.NewReader failed: %v (accumBuf=%d bytes, first: %x)", err, len(accumBuf), accumBuf[:min(8, len(accumBuf))])
-				return nil
-			}
-			// Read decompressed output. The zlib stream is continuous, so we
-			// collect whatever output is available before ErrUnexpectedEOF.
-			var decompressed []byte
-			tmpBuf := make([]byte, 32768)
-			for {
-				n, readErr := zr.Read(tmpBuf)
-				if n > 0 {
-					decompressed = append(decompressed, tmpBuf[:n]...)
-				}
-				if readErr != nil {
-					if readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-						log.Printf("zlib read: %v (got %d bytes)", readErr, len(decompressed))
-					}
-					break
+			if sd == nil {
+				if err := initStreamDecompressor(); err != nil {
+					return nil
 				}
 			}
-			zr.Close()
 
-			// This rect's tile data is the new bytes since last call
-			if len(decompressed) <= decompOff {
+			// Skip if no valid zlib header and stream not yet initialized
+			if len(sd.out) == 0 && (len(zlibData) < 2 || zlibData[0] != 0x78 || zlibData[1] != 0x9c) {
 				return nil
 			}
-			rectData := decompressed[decompOff:]
-			decompOff = len(decompressed)
+
+			// Record current output length
+			sd.outMu.Lock()
+			prevLen := len(sd.out)
+			sd.outMu.Unlock()
+
+			// Feed zlib data to the pipe. This blocks until the decompressor
+			// goroutine has consumed ALL the data.
+			sd.pipeW.Write(zlibData)
+
+			// The decompressor goroutine has consumed all zlib data.
+			// Give it a brief moment to append the decompressed output.
+			time.Sleep(2 * time.Millisecond)
+
+			// Read the new output (this rect's tile data)
+			sd.outMu.Lock()
+			newLen := len(sd.out)
+			var rectData []byte
+			if newLen > prevLen {
+				rectData = make([]byte, newLen-prevLen)
+				copy(rectData, sd.out[prevLen:newLen])
+			}
+			sd.outMu.Unlock()
+
+			if len(rectData) == 0 {
+				return nil
+			}
 
 			// Re-compress as standalone zlib (with 789c header)
 			var recompressed bytes.Buffer
