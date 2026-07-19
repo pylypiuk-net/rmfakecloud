@@ -216,6 +216,36 @@ type serverInitInfo struct {
 	name       string
 }
 
+// chunkReader is a simple io.Reader that returns (0, nil) when empty
+// instead of io.EOF. This lets us feed compressed data incrementally
+// to a persistent zlib.Reader without closing the stream.
+type chunkReader struct {
+	mu   sync.Mutex
+	data []byte
+	pos  int
+}
+
+func (cr *chunkReader) Read(p []byte) (int, error) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if cr.pos >= len(cr.data) {
+		// Trim consumed data to free memory
+		if cr.pos > 0 {
+			cr.data = cr.data[:0]
+			cr.pos = 0
+		}
+		return 0, nil // no more data — not EOF
+	}
+	n := copy(p, cr.data[cr.pos:])
+	cr.pos += n
+	// Trim consumed data periodically
+	if cr.pos > 1<<20 { // >1MB consumed
+		cr.data = append(cr.data[:0], cr.data[cr.pos:]...)
+		cr.pos = 0
+	}
+	return n, nil
+}
+
 func rfbHandshake(conn *tls.Conn, challenge []byte) (*serverInitInfo, error) {
 	// Read server version (12 bytes)
 	version := make([]byte, 12)
@@ -460,57 +490,65 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-	// ZRLE decompression: accumulate compressed data, decompress per-frame
-	// with fresh zlib.Reader (O(n²) but bounded by MAX_ACCUM_BYTES).
-	// The rM VNC server's zlib stream persists across TCP reconnections and
-	// screen share stop/start — only a tablet reboot resets it. So we can't
-	// rely on getting a 789c header for late-joining viewers.
+	// ZRLE decompression: persistent streaming decompressor.
 	//
-	// Approach: accumulate compressed ZRLE data. Per frame: create fresh
-	// zlib.Reader on accumulated buffer, io.ReadAll, take only the NEW
-	// decompressed bytes, re-compress as standalone zlib for the viewer.
-	// When accumulated buffer exceeds MAX_ACCUM_BYTES, trim the front — but
-	// keep enough history so zlib.NewReader can still initialize. We do this
-	// by keeping the first 2 bytes (789c header) + the last MAX_ACCUM_BYTES.
+	// The rM VNC server's zlib stream persists across TCP reconnections
+	// and screen share stop/start. We maintain a single zlib.Reader over
+	// a custom chunkReader that returns (0, nil) when empty (not io.EOF,
+	// not blocking). This lets us call zr.Read in a loop and stop when
+	// no more data is available — O(n) per frame, ~5ms latency regardless
+	// of session length.
+	//
+	// Each frame's decompressed output is re-compressed as a standalone
+	// zlib stream (with 789c header) so the browser can decode it
+	// independently with pako.inflate().
 
+	cr := &chunkReader{}
 
-	type accumState struct {
-		compressed []byte
-		prevDecLen int
+	zr, zrErr := zlib.NewReader(cr)
+	if zrErr != nil {
+		log.Printf("ZRLE: failed to create zlib reader: %v", zrErr)
+		return
 	}
-	zrState := &accumState{}
+	defer zr.Close()
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		zrState.compressed = append(zrState.compressed, zlibData...)
+		// Append compressed data to the chunkReader
+		cr.mu.Lock()
+		cr.data = append(cr.data, zlibData...)
+		cr.mu.Unlock()
 
-		// Fresh zlib.Reader on full accumulated buffer
-		zr, err := zlib.NewReader(bytes.NewReader(zrState.compressed))
-		if err != nil {
-			// Can't init — shouldn't happen if we keep the 789c header
-			log.Printf("ZRLE zlib.NewReader failed: %v, len=%d", err, len(zrState.compressed))
+		// Read all available decompressed output. zr.Read returns
+		// (0, nil) when the chunkReader is empty (no more data).
+		var decompressed []byte
+		chunk := make([]byte, 128*1024)
+		for {
+			n, err := zr.Read(chunk)
+			if n > 0 {
+				decompressed = append(decompressed, chunk[:n]...)
+			}
+			if err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "EOF") {
+					log.Printf("ZRLE: zlib stream ended: %v", err)
+					return nil
+				}
+				log.Printf("ZRLE: read error: %v", err)
+				return nil
+			}
+			if n == 0 {
+				break // no more data available
+			}
+		}
+
+		if len(decompressed) == 0 {
 			return nil
 		}
-		decompressed, _ := io.ReadAll(zr)
-		zr.Close()
-
-		if len(decompressed) <= zrState.prevDecLen {
-			// No new output
-			return nil
-		}
-
-		// Extract only the NEW decompressed bytes
-		newData := decompressed[zrState.prevDecLen:]
-		zrState.prevDecLen = len(decompressed)
-
-		// No trimming — let the accumulator grow. At 1fps × 60KB/frame,
-		// it takes ~5min to reach 18MB (decompresses in ~200-500ms on ARM).
-		// User can stop/start screen share to reset the zlib stream.
 
 		// Re-compress as standalone zlib
 		var recompressed bytes.Buffer
-		w := zlib.NewWriter(&recompressed)
-		w.Write(newData)
-		w.Close()
+		zw := zlib.NewWriter(&recompressed)
+		zw.Write(decompressed)
+		zw.Close()
 		out := make([]byte, 4+recompressed.Len())
 		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
 		copy(out[4:], recompressed.Bytes())
