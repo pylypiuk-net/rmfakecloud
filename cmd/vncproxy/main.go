@@ -514,22 +514,22 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-		// ZRLE decompression: unbounded accumulator.
-	// The rM VNC server hardcodes ZRLE with a persistent zlib stream.
-	// We accumulate ALL compressed data and decompress from scratch each
-	// frame, then re-compress as standalone zlib. O(n²) but correct.
+		// ZRLE decompression: unbounded accumulator with per-rect delta.
+	// The rM VNC server uses a persistent zlib stream shared across all
+	// ZRLE rects. We accumulate ALL compressed data and decompress from
+	// scratch each rect. For each rect, we send only the NEW decompressed
+	// bytes (delta from the previous rect) — this is exactly that rect's
+	// ZRLE tile data. The viewer's ZRLE renderer then parses tiles correctly.
 	var accum []byte
+	var lastDecompressedLen int
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
 		accum = append(accum, zlibData...)
 
-		// The rM VNC server uses a persistent zlib stream. The first frame
-		// has a 2-byte zlib header (78 9c), subsequent frames are raw DEFLATE
-		// continuation. The stream never sends a final checksum (no EOF).
-		// Use flate.NewReader (raw DEFLATE) and skip the zlib header.
+		// The rM VNC server's zlib stream never sends a final checksum.
+		// Use flate.NewReader (raw DEFLATE) and skip the 2-byte zlib header.
 		accumData := accum
 		if len(accumData) >= 2 && accumData[0] == 0x78 {
-			// Skip 2-byte zlib header
 			accumData = accumData[2:]
 		}
 
@@ -537,19 +537,25 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		defer fr.Close()
 
 		var decompressed bytes.Buffer
-		// Read as much as possible — ignore EOF (stream never ends cleanly)
 		io.Copy(&decompressed, fr)
 
-		if decompressed.Len() == 0 {
-			log.Printf("ZRLE: decompressed 0 bytes, accum=%d", len(accum))
+		if decompressed.Len() <= lastDecompressedLen {
+			// No new data for this rect
 			return nil
 		}
-		log.Printf("ZRLE: decompressed %d bytes from accum=%d", decompressed.Len(), len(accum))
 
-		// Re-compress as standalone zlib
+		// Take only the new decompressed bytes (this rect's tile data)
+		newData := decompressed.Bytes()[lastDecompressedLen:]
+		lastDecompressedLen = decompressed.Len()
+
+		if len(newData) == 0 {
+			return nil
+		}
+
+		// Re-compress as standalone zlib (viewer uses pako.inflate)
 		var recompressed bytes.Buffer
 		zw := zlib.NewWriter(&recompressed)
-		zw.Write(decompressed.Bytes())
+		zw.Write(newData)
 		zw.Close()
 		out := make([]byte, 4+recompressed.Len())
 		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
