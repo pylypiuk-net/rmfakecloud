@@ -239,28 +239,27 @@ export default function VNCViewer() {
       return;
     }
 
-    // Decompress ZRLE — persistent pako.Inflate with onData callback.
-    // The rM VNC server uses a continuous zlib stream. The first frame (after
-    // screen share stop/start) has the 789c zlib header. Subsequent frames are
-    // continuations. pako's persistent Inflate with push(data, false) handles
-    // this correctly — onData fires when the decompressor produces output.
-    let decompressed;
+    // Decompress ZRLE — persistent pako.Inflate + persistent decompressed buffer.
+    // The rM VNC server uses a continuous zlib stream. pako's Inflate buffers
+    // internally, so a push() might output data from the previous frame's
+    // buffered input. We maintain a persistent decompressed buffer and a
+    // consumed offset. Each frame: append new decompressed output, parse tiles
+    // from the buffer starting at the consumed offset, update the offset.
     try {
       if (!state.zrleInflate) {
         state.zrleInflate = new pako.Inflate();
-        state.zrleCollected = new Uint8Array(0);
+        state.zrleDecompressed = new Uint8Array(0);
+        state.zrleConsumed = 0;
         state.zrleInflate.onData = (chunk) => {
-          const merged = new Uint8Array(state.zrleCollected.length + chunk.length);
-          merged.set(state.zrleCollected);
-          merged.set(chunk, state.zrleCollected.length);
-          state.zrleCollected = merged;
+          const merged = new Uint8Array(state.zrleDecompressed.length + chunk.length);
+          merged.set(state.zrleDecompressed);
+          merged.set(chunk, state.zrleDecompressed.length);
+          state.zrleDecompressed = merged;
         };
       }
-      state.zrleCollected = new Uint8Array(0);
       state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), false);
-      decompressed = state.zrleCollected;
-      if (decompressed.length === 0) {
-        // No output yet — decompressor buffering, wait for next frame
+      if (state.zrleDecompressed.length <= state.zrleConsumed) {
+        // No new output — decompressor buffering, wait for next frame
         return;
       }
     } catch (e) {
@@ -268,9 +267,20 @@ export default function VNCViewer() {
       return;
     }
 
+    // Parse tiles from the persistent decompressed buffer starting at consumed offset.
+    // Each frame's ZRLE rect covers the full screen (1404x1872), so we parse
+    // a full screen's worth of tiles from the current position.
+    const decompressed = state.zrleDecompressed;
     const dv = new DataView(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength);
     const bypp = state.bytesPerPixel;
-    let offset = 0;
+    let offset = state.zrleConsumed;
+
+    // Check we have enough data for a full screen of tiles
+    // Minimum: 660 tiles × 1 byte subenc = 660 bytes (if all solid color)
+    if (offset + 660 > dv.byteLength) {
+      // Not enough data yet, wait for more
+      return;
+    }
 
     // Helper: read a pixel from decompressed data
     const readPixel = (off) => {
@@ -279,14 +289,16 @@ export default function VNCViewer() {
       return dv.getUint8(off);
     };
 
-    // Process 64x64 tiles
-    for (let ty = 0; ty < h; ty += 64) {
-      for (let tx = 0; tx < w; tx += 64) {
+    // Process 64x64 tiles. Stop when we run out of data, and save the offset
+    // so the next frame continues from where we left off.
+    let outOfData = false;
+    for (let ty = 0; ty < h && !outOfData; ty += 64) {
+      for (let tx = 0; tx < w && !outOfData; tx += 64) {
         const tw = Math.min(64, w - tx);
         const th = Math.min(64, h - ty);
         const tilePixels = tw * th;
 
-        if (offset + 1 > dv.byteLength) return;
+        if (offset + 1 > dv.byteLength) { outOfData = true; break; }
 
         const subenc = dv.getUint8(offset);
         if (ty === 0 && tx === 0) console.log('[VNC] ZRLE first tile subenc:', subenc, 'offset:', offset);
@@ -295,13 +307,13 @@ export default function VNCViewer() {
         if (subenc === 0) {
           // Raw tile
           const tileBytes = tilePixels * bypp;
-          if (offset + tileBytes > dv.byteLength) return;
+          if (offset + tileBytes > dv.byteLength) { outOfData = true; break; }
           const tileData = new Uint8Array(decompressed.buffer, decompressed.byteOffset + offset, tileBytes);
           renderRAW(x + tx, y + ty, tw, th, tileData, state);
           offset += tileBytes;
         } else if (subenc === 1) {
           // Single color (RLE of entire tile)
-          if (offset + bypp > dv.byteLength) return;
+          if (offset + bypp > dv.byteLength) { outOfData = true; break; }
           const pixel = readPixel(offset);
           offset += bypp;
           const [r, g, b, a] = pixelToRGBA(pixel, state);
@@ -315,24 +327,23 @@ export default function VNCViewer() {
           ctx.putImageData(tileImg, x + tx, y + ty);
         } else if (subenc <= 127) {
           // Palette + RLE
-          // Read palette colors
           const palette = [];
           for (let p = 0; p < subenc; p++) {
-            if (offset + bypp > dv.byteLength) return;
+            if (offset + bypp > dv.byteLength) { outOfData = true; break; }
             palette.push(readPixel(offset));
             offset += bypp;
           }
-          // Read RLE data: index byte (0-127 = palette index, 128-255 = run length follows)
+          if (outOfData) break;
           const tileImg = ctx.createImageData(tw, th);
           let idx = 0;
           while (idx < tilePixels) {
-            if (offset + 1 > dv.byteLength) return;
+            if (offset + 1 > dv.byteLength) { outOfData = true; break; }
             const idxByte = dv.getUint8(offset);
             offset++;
             const palIdx = idxByte & 0x7f;
             let runLen = 1;
             if (idxByte & 0x80) {
-              if (offset + 1 > dv.byteLength) return;
+              if (offset + 1 > dv.byteLength) { outOfData = true; break; }
               runLen = dv.getUint8(offset) + 1;
               offset++;
             }
@@ -344,21 +355,20 @@ export default function VNCViewer() {
               tileImg.data[idx * 4 + 3] = a;
             }
           }
-          ctx.putImageData(tileImg, x + tx, y + ty);
+          if (!outOfData) ctx.putImageData(tileImg, x + tx, y + ty);
         } else {
-          // 128-255: palette + raw subrects (subenc & 0x7f = num palette entries)
+          // 128-255: palette + raw subrects
           const numColors = subenc & 0x7f;
           const palette = [];
           for (let p = 0; p < numColors; p++) {
-            if (offset + bypp > dv.byteLength) return;
+            if (offset + bypp > dv.byteLength) { outOfData = true; break; }
             palette.push(readPixel(offset));
             offset += bypp;
           }
-          // Read numColors bytes per pixel (packed indices)
-          // Each pixel is a palette index (numColors <= 127, so 1 byte each)
+          if (outOfData) break;
           const tileImg = ctx.createImageData(tw, th);
           for (let i = 0; i < tilePixels; i++) {
-            if (offset + 1 > dv.byteLength) return;
+            if (offset + 1 > dv.byteLength) { outOfData = true; break; }
             const palIdx = dv.getUint8(offset);
             offset++;
             const [r, g, b, a] = pixelToRGBA(palette[palIdx], state);
@@ -367,9 +377,19 @@ export default function VNCViewer() {
             tileImg.data[i * 4 + 2] = b;
             tileImg.data[i * 4 + 3] = a;
           }
-          ctx.putImageData(tileImg, x + tx, y + ty);
+          if (!outOfData) ctx.putImageData(tileImg, x + tx, y + ty);
         }
       }
+    }
+
+    // Save consumed offset for the next frame
+    state.zrleConsumed = offset;
+
+    // If we've consumed a full screen of tiles, reset the buffer to save memory
+    if (!outOfData && state.zrleConsumed > 1000000) {
+      const remaining = decompressed.slice(state.zrleConsumed);
+      state.zrleDecompressed = remaining;
+      state.zrleConsumed = 0;
     }
   }, [pixelToRGBA, renderRAW]);
   // Parse the RFB byte stream from the buffer
@@ -588,7 +608,8 @@ export default function VNCViewer() {
       if (state.zrleInflate) {
         try { state.zrleInflate.push(new Uint8Array(0), true); } catch(e) {}
         state.zrleInflate = null;
-        state.zrleCollected = null;
+        state.zrleDecompressed = null;
+        state.zrleConsumed = 0;
       }
     };
 
