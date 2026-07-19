@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -524,20 +525,60 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-		// ZRLE decompression: OFFLOADED TO VIEWER.
-		// The proxy forwards raw ZRLE bytes. The viewer maintains a
-		// persistent pako.Inflate stream and takes per-rect deltas.
-		// This is the correct architecture — the viewer owns the zlib
-		// stream state and can correctly split decompressed output by rect.
+		// ZRLE decompression: SERVER-SIDE with persistent accumulator.
+		// The rM VNC server uses a single persistent zlib stream across all
+		// ZRLE rects/frames. We accumulate all zlib data and re-decompress
+		// from scratch each frame. The decompressed output contains ALL tiles
+		// for ALL rects. We track the byte offset per rect and slice accordingly.
+		// Each rect's tile data is then re-compressed as standalone zlib (789c).
 
-	decodeZRLEFrame := func(zlibData []byte) []byte {
-		// Forward raw bytes with 4-byte length prefix (viewer expects this format).
-		// The viewer's persistent pako.Inflate handles the zlib stream and per-rect splitting.
-		out := make([]byte, 4+len(zlibData))
-		binary.BigEndian.PutUint32(out[:4], uint32(len(zlibData)))
-		copy(out[4:], zlibData)
-		return out
-	}
+		var (
+			accumBuf   []byte
+			decompOff  int // offset in decompressed output consumed so far
+		)
+
+		decodeZRLEFrame := func(zlibData []byte, w, h int) []byte {
+			// Append this rect's zlib data to the accumulator
+			accumBuf = append(accumBuf, zlibData...)
+
+			// Re-decompress from scratch
+			zr, err := zlib.NewReader(bytes.NewReader(accumBuf))
+			if err != nil {
+				log.Printf("zlib.NewReader failed: %v (accumBuf=%d bytes, first: %x)", err, len(accumBuf), accumBuf[:min(8, len(accumBuf))])
+				return nil
+			}
+			decompressed, err := io.ReadAll(zr)
+			zr.Close()
+			if err != nil {
+				log.Printf("zlib read failed: %v", err)
+				return nil
+			}
+
+			// This rect's tile data starts at decompOff and has a known size.
+			// ZRLE uses 64x64 tiles. Each tile has a 1-byte subencoding + tile data.
+			// The exact size depends on the subencoding, which we don't know without
+			// parsing. So we use the difference between this decompression and the
+			// previous one as this rect's data.
+			if len(decompressed) <= decompOff {
+				// No new data for this rect
+				return nil
+			}
+			rectData := decompressed[decompOff:]
+			decompOff = len(decompressed)
+
+			// Re-compress as standalone zlib (with 789c header)
+			var recompressed bytes.Buffer
+			zw := zlib.NewWriter(&recompressed)
+			zw.Write(rectData)
+			zw.Close()
+
+			// Return with 4-byte length prefix (viewer expects this)
+			out := make([]byte, 4+recompressed.Len())
+			binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
+			copy(out[4:], recompressed.Bytes())
+			return out
+		}
+		_ = decodeZRLEFrame
 
 	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
 		if len(msg) < 4 {
@@ -567,7 +608,7 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 					return msg
 				}
 				zlibData := msg[offset+16 : offset+16+zlibLen]
-				newData := decodeZRLEFrame(zlibData)
+				newData := decodeZRLEFrame(zlibData, w, h)
 				if newData == nil {
 					return nil
 				}
