@@ -16,8 +16,6 @@ package main
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -526,39 +524,16 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-		// ZRLE decompression: unbounded accumulator (re-decompress from scratch
-	// each rect). O(n²) but CORRECT — the streaming approach can't split
-	// the persistent DEFLATE stream at rect boundaries.
-	var accum []byte
+		// ZRLE decompression: OFFLOADED TO VIEWER.
+		// The proxy forwards raw ZRLE bytes. The viewer maintains a
+		// persistent pako.Inflate stream and takes per-rect deltas.
+		// This is the correct architecture — the viewer owns the zlib
+		// stream state and can correctly split decompressed output by rect.
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		accum = append(accum, zlibData...)
-
-		// Skip 2-byte zlib header if present
-		accumData := accum
-		if len(accumData) >= 2 && accumData[0] == 0x78 {
-			accumData = accumData[2:]
-		}
-
-		fr := flate.NewReader(bytes.NewReader(accumData))
-		defer fr.Close()
-
-		var decompressed bytes.Buffer
-		io.Copy(&decompressed, fr)
-
-		if decompressed.Len() == 0 {
-			return nil
-		}
-
-		// Re-compress as standalone zlib (viewer uses pako.inflate)
-		var recompressed bytes.Buffer
-		zw := zlib.NewWriter(&recompressed)
-		zw.Write(decompressed.Bytes())
-		zw.Close()
-		out := make([]byte, 4+recompressed.Len())
-		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
-		copy(out[4:], recompressed.Bytes())
-		return out
+		// Forward raw bytes unchanged. The viewer's persistent pako.Inflate
+		// handles the zlib stream and per-rect splitting.
+		return zlibData
 	}
 
 	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
@@ -570,7 +545,6 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 		var out bytes.Buffer
 		out.Write(msg[:4])
 		changed := false
-		zrleRectSeen := false
 
 		for r := 0; r < numRects; r++ {
 			if offset+12 > len(msg) {
@@ -582,18 +556,6 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 			h := int(binary.BigEndian.Uint16(rectHeader[6:8]))
 
 			if enc == 16 { // ZRLE
-				// Only decompress the first ZRLE rect per frame.
-				// Subsequent ZRLE rects would get the full accumulated
-				// output again, causing corruption. Skip them.
-				if zrleRectSeen {
-					if offset+16 > len(msg) {
-						return msg
-					}
-					zlibLen := int(binary.BigEndian.Uint32(msg[offset+12 : offset+16]))
-					offset += 16 + zlibLen
-					continue
-				}
-				zrleRectSeen = true
 				if offset+16 > len(msg) {
 					return msg
 				}
