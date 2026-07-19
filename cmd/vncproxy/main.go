@@ -216,34 +216,59 @@ type serverInitInfo struct {
 	name       string
 }
 
-// chunkReader is a simple io.Reader that returns (0, nil) when empty
-// instead of io.EOF. This lets us feed compressed data incrementally
-// to a persistent zlib.Reader without closing the stream.
+// chunkReader is a blocking io.Reader that waits for data to be
+// available before returning. This is required because Go's zlib
+// reader treats (0, nil) as "no progress" and errors out.
 type chunkReader struct {
-	mu   sync.Mutex
-	data []byte
-	pos  int
+	mu     sync.Mutex
+	data   []byte
+	pos    int
+	cond   *sync.Cond
+	closed bool
+}
+
+func newChunkReader() *chunkReader {
+	cr := &chunkReader{}
+	cr.cond = sync.NewCond(&cr.mu)
+	return cr
 }
 
 func (cr *chunkReader) Read(p []byte) (int, error) {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
-	if cr.pos >= len(cr.data) {
-		// Trim consumed data to free memory
-		if cr.pos > 0 {
-			cr.data = cr.data[:0]
-			cr.pos = 0
+
+	// Wait until data is available or closed
+	for cr.pos >= len(cr.data) {
+		if cr.closed {
+			return 0, io.EOF
 		}
-		return 0, nil // no more data — not EOF
+		cr.cond.Wait()
 	}
+
 	n := copy(p, cr.data[cr.pos:])
 	cr.pos += n
-	// Trim consumed data periodically
-	if cr.pos > 1<<20 { // >1MB consumed
-		cr.data = append(cr.data[:0], cr.data[cr.pos:]...)
+
+	// Trim consumed data to free memory
+	if cr.pos >= len(cr.data) {
+		cr.data = cr.data[:0]
 		cr.pos = 0
 	}
+
 	return n, nil
+}
+
+func (cr *chunkReader) append(data []byte) {
+	cr.mu.Lock()
+	cr.data = append(cr.data, data...)
+	cr.cond.Signal()
+	cr.mu.Unlock()
+}
+
+func (cr *chunkReader) close() {
+	cr.mu.Lock()
+	cr.closed = true
+	cr.cond.Broadcast()
+	cr.mu.Unlock()
 }
 
 func rfbHandshake(conn *tls.Conn, challenge []byte) (*serverInitInfo, error) {
@@ -503,64 +528,83 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	// zlib stream (with 789c header) so the browser can decode it
 	// independently with pako.inflate().
 
-	cr := &chunkReader{}
+	cr := newChunkReader()
+	defer cr.close()
 
-	// Lazily create the zlib reader on the first frame, when we
-	// actually have data (the zlib header). zlib.NewReader blocks
-	// until it can read the 2-byte header.
+	// Persistent streaming decompressor: reader goroutine reads from
+	// zr (which blocks on cr when empty), accumulates decompressed
+	// output into a shared buffer. feed() appends data, waits for
+	// the reader to produce output, then takes it.
 	var zr io.ReadCloser
-	var zrOnce sync.Once
-	var zrErr error
 	var zrOK bool
+	var zrInitErr error
+	var zrInitOnce sync.Once
+
+	var outMu sync.Mutex
+	var output []byte
+
+	readerStarted := make(chan struct{})
+	go func() {
+		defer close(readerStarted)
+		// Wait for zr to be initialized
+		<-readerStarted
+		if !zrOK {
+			return
+		}
+		chunk := make([]byte, 64*1024)
+		for {
+			n, err := zr.Read(chunk)
+			if n > 0 {
+				outMu.Lock()
+				output = append(output, chunk[:n]...)
+				outMu.Unlock()
+			}
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("ZRLE reader: %v", err)
+				}
+				return
+			}
+			// zr.Read blocks on cr when empty — we'll wake up
+			// when feed() appends more data.
+		}
+	}()
 
 	decodeZRLEFrame := func(zlibData []byte) []byte {
-		// Append compressed data to the chunkReader
-		cr.mu.Lock()
-		cr.data = append(cr.data, zlibData...)
-		cr.mu.Unlock()
+		cr.append(zlibData)
 
-		zrOnce.Do(func() {
-			zr, zrErr = zlib.NewReader(cr)
-			if zrErr != nil {
-				log.Printf("ZRLE: failed to create zlib reader: %v", zrErr)
+		zrInitOnce.Do(func() {
+			zr, zrInitErr = zlib.NewReader(cr)
+			if zrInitErr != nil {
+				log.Printf("ZRLE: failed to create zlib reader: %v", zrInitErr)
 				return
 			}
 			zrOK = true
+			close(readerStarted) // start the reader goroutine
 		})
 		if !zrOK {
 			return nil
 		}
 
-		// Read all available decompressed output. zr.Read returns
-		// (0, nil) when the chunkReader is empty (no more data).
-		var decompressed []byte
-		chunk := make([]byte, 128*1024)
-		for {
-			n, err := zr.Read(chunk)
-			if n > 0 {
-				decompressed = append(decompressed, chunk[:n]...)
-			}
-			if err != nil {
-				if err == io.EOF || strings.Contains(err.Error(), "EOF") {
-					log.Printf("ZRLE: zlib stream ended: %v", err)
-					return nil
-				}
-				log.Printf("ZRLE: read error: %v", err)
-				return nil
-			}
-			if n == 0 {
-				break // no more data available
-			}
-		}
+		// Give the reader goroutine time to decompress the data.
+		// zr.Read blocks on cr when empty; the reader will process
+		// all available data then block. 20ms is enough for ARM to
+		// decompress ~60KB.
+		time.Sleep(20 * time.Millisecond)
 
-		if len(decompressed) == 0 {
+		outMu.Lock()
+		newData := output
+		output = nil
+		outMu.Unlock()
+
+		if len(newData) == 0 {
 			return nil
 		}
 
 		// Re-compress as standalone zlib
 		var recompressed bytes.Buffer
 		zw := zlib.NewWriter(&recompressed)
-		zw.Write(decompressed)
+		zw.Write(newData)
 		zw.Close()
 		out := make([]byte, 4+recompressed.Len())
 		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
