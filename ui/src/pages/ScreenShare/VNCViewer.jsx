@@ -239,28 +239,10 @@ export default function VNCViewer() {
       return;
     }
 
-    // Decompress ZRLE — persistent pako.Inflate with onData callback.
-    // The rM VNC server uses a continuous zlib stream. pako's onData fires
-    // when the decompressor produces output. We collect per-push and render.
+    // Decompress ZRLE — proxy re-compresses each frame as standalone zlib
     let decompressed;
     try {
-      if (!state.zrleInflate) {
-        state.zrleInflate = new pako.Inflate();
-        state.zrleCollected = new Uint8Array(0);
-        state.zrleInflate.onData = (chunk) => {
-          const merged = new Uint8Array(state.zrleCollected.length + chunk.length);
-          merged.set(state.zrleCollected);
-          merged.set(chunk, state.zrleCollected.length);
-          state.zrleCollected = merged;
-        };
-      }
-      state.zrleCollected = new Uint8Array(0);
-      state.zrleInflate.push(pixelData.slice(4, 4 + zlibLen), false);
-      decompressed = state.zrleCollected;
-      if (decompressed.length === 0) {
-        // No output yet — decompressor buffering, wait for next frame
-        return;
-      }
+      decompressed = pako.inflate(pixelData.slice(4, 4 + zlibLen));
     } catch (e) {
       console.warn('[VNC] ZRLE inflate failed:', e.message);
       return;
@@ -582,12 +564,6 @@ export default function VNCViewer() {
     ws.onopen = () => {
       setStatus('connected');
       console.log('[VNC] WebSocket connected');
-      // Reset ZRLE inflate context on new connection
-      if (state.zrleInflate) {
-        try { state.zrleInflate.push(new Uint8Array(0), true); } catch(e) {}
-        state.zrleInflate = null;
-        state.zrleCollected = null;
-      }
     };
 
     ws.onmessage = (e) => {

@@ -15,6 +15,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -46,6 +48,61 @@ const (
 	PSEUDO_CURSOR      = -239
 	PSEUDO_DESKTOPSIZE = -223
 )
+
+// chunkedReader is an io.Reader that blocks on Read until data is available.
+// It allows feeding data incrementally — the zlib reader will block waiting
+// for more data, and we can add chunks as they arrive from the VNC server.
+type chunkedReader struct {
+	mu     sync.Mutex
+	chunks [][]byte
+	pos    int
+	closed bool
+	notify chan struct{}
+}
+
+func newChunkedReader() *chunkedReader {
+	return &chunkedReader{notify: make(chan struct{}, 1)}
+}
+
+func (c *chunkedReader) Add(data []byte) {
+	c.mu.Lock()
+	c.chunks = append(c.chunks, data)
+	c.mu.Unlock()
+	select { case c.notify <- struct{}{}: default: }
+}
+
+func (c *chunkedReader) Close() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	select { case c.notify <- struct{}{}: default: }
+}
+
+func (c *chunkedReader) Read(p []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		if len(c.chunks) > 0 {
+			chunk := c.chunks[0]
+			avail := len(chunk) - c.pos
+			n := len(p)
+			if n > avail { n = avail }
+			copy(p, chunk[c.pos:c.pos+n])
+			c.pos += n
+			if c.pos >= len(chunk) {
+				c.chunks = c.chunks[1:]
+				c.pos = 0
+			}
+			c.mu.Unlock()
+			return n, nil
+		}
+		if c.closed {
+			c.mu.Unlock()
+			return 0, io.EOF
+		}
+		c.mu.Unlock()
+		<-c.notify
+	}
+}
 
 func main() {
 	deviceToken := os.Getenv("DEVICE_TOKEN")
@@ -439,11 +496,172 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 	log.Printf("Sent RFBF meta: %dx%d bpp=%d depth=%d R/G/B=%d/%d/%d shift=%d/%d/%d",
 		w, h, info.bpp, info.depth, info.redMax, info.greenMax, info.blueMax,
 		info.redShift, info.greenShift, info.blueShift)
-	// No server-side ZRLE decompression — forward raw ZRLE to the viewer.
-	// The viewer maintains a persistent pako.Inflate with onData callback.
-	// The rM VNC server uses a continuous zlib stream; the persistent Inflate
-	// context handles this correctly (O(n) — no re-decompression).
-	// Late joiners: proxy reconnects VNC every 30s for a fresh zlib stream.
+	// ZRLE decompression with persistent zlib reader.
+	// The rM VNC server uses a single continuous zlib stream that never resets
+	// (not even on VNC reconnect). We use a custom chunkedReader that blocks
+	// until data is available, plus a reader goroutine that reads decompressed
+	// data continuously. Per frame: feed compressed data, collect decompressed
+	// output with a timeout (reader blocks when it needs more input = frame
+	// boundary). Re-compress as standalone zlib for the viewer.
+	
+	type zrChunk struct {
+		data []byte
+	}
+	zrFeedCh := make(chan zrChunk, 100)
+	
+	// chunkedReader: blocks on Read until data is available
+	cr := newChunkedReader()
+	
+	// Create zlib reader (reads 789c header from first chunk)
+	var zr io.ReadCloser
+	var zrErr error
+	zrReady := make(chan struct{})
+	go func() {
+		zr, zrErr = zlib.NewReader(cr)
+		close(zrReady)
+	}()
+	
+	// Writer goroutine: feeds compressed data to chunkedReader
+	go func() {
+		for chunk := range zrFeedCh {
+			cr.Add(chunk.data)
+		}
+		cr.Close()
+	}()
+	
+	// Reader goroutine: reads decompressed data continuously
+	type readResult struct { data []byte; err error }
+	dataCh := make(chan readResult, 100)
+	go func() {
+		<-zrReady
+		if zrErr != nil {
+			dataCh <- readResult{nil, zrErr}
+			return
+		}
+		tmp := make([]byte, 65536)
+		for {
+			n, err := zr.Read(tmp)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, tmp[:n])
+				dataCh <- readResult{data, nil}
+			}
+			if err != nil {
+				dataCh <- readResult{nil, err}
+				return
+			}
+		}
+	}()
+	
+	// decodeZRLEFrame: feed compressed data, collect decompressed with timeout
+	decodeZRLEFrame := func(zlibData []byte) []byte {
+		// Feed compressed data
+		zrFeedCh <- zrChunk{data: zlibData}
+		
+		// Wait for zlib reader init (only blocks on first call)
+		select {
+		case <-zrReady:
+		default:
+			<-zrReady
+		}
+		if zrErr != nil {
+			return nil
+		}
+		
+		// Collect decompressed data with timeout
+		// 200ms timeout: reader blocks when it needs more input = frame boundary
+		buf := make([]byte, 0, 5257236+8192)
+		timeout := time.After(200 * time.Millisecond)
+	collect:
+		for {
+			select {
+			case res := <-dataCh:
+				if res.data != nil {
+					buf = append(buf, res.data...)
+				}
+				if res.err != nil {
+					break collect
+				}
+			case <-timeout:
+				break collect
+			}
+		}
+		
+		if len(buf) == 0 {
+			return nil
+		}
+		
+		// Re-compress as standalone zlib
+		var recompressed bytes.Buffer
+		w := zlib.NewWriter(&recompressed)
+		w.Write(buf)
+		w.Close()
+		out := make([]byte, 4+recompressed.Len())
+		binary.BigEndian.PutUint32(out[:4], uint32(recompressed.Len()))
+		copy(out[4:], recompressed.Bytes())
+		return out
+	}
+	
+	// decodeZRLEInPlace: finds ZRLE rects, decompresses, rebuilds message
+	decodeZRLEInPlace := func(msg []byte, info serverInitInfo) []byte {
+		if len(msg) < 4 {
+			return msg
+		}
+		numRects := int(binary.BigEndian.Uint16(msg[2:4]))
+		offset := 4
+		var out bytes.Buffer
+		out.Write(msg[:4])
+		changed := false
+
+		for r := 0; r < numRects; r++ {
+			if offset+12 > len(msg) {
+				return msg
+			}
+			rectHeader := msg[offset : offset+12]
+			enc := int32(binary.BigEndian.Uint32(rectHeader[8:12]))
+			w := int(binary.BigEndian.Uint16(rectHeader[4:6]))
+			h := int(binary.BigEndian.Uint16(rectHeader[6:8]))
+
+			if enc == 16 { // ZRLE
+				if offset+16 > len(msg) {
+					return msg
+				}
+				zlibLen := int(binary.BigEndian.Uint32(msg[offset+12 : offset+16]))
+				if offset+16+zlibLen > len(msg) {
+					return msg
+				}
+				zlibData := msg[offset+16 : offset+16+zlibLen]
+				newData := decodeZRLEFrame(zlibData)
+				if newData == nil {
+					return nil
+				}
+				newRect := make([]byte, 12+len(newData))
+				copy(newRect[:12], rectHeader)
+				copy(newRect[12:], newData)
+				out.Write(newRect)
+				offset += 16 + zlibLen
+				changed = true
+			} else if enc == 0 { // RAW
+				rectLen := w * h * int(info.bpp) / 8
+				if offset+12+rectLen > len(msg) {
+					return msg
+				}
+				out.Write(msg[offset : offset+12+rectLen])
+				offset += 12 + rectLen
+			} else if enc == -223 { // DesktopSize
+				out.Write(rectHeader)
+				offset += 12
+			} else {
+				out.Write(msg[offset:])
+				break
+			}
+		}
+
+		if !changed {
+			return msg
+		}
+		return out.Bytes()
+	}
 
 	done := make(chan struct{}, 2)
 	totalBytes := 0
@@ -578,6 +796,17 @@ func pipeRFBStream(rfbConn *tls.Conn, serverHost, serverPort, deviceToken string
 
 				if consumed {
 					msg := frameBuf[:msgLen]
+
+					// Decompress ZRLE and re-encode as standalone zlib per frame
+					if msgType == 0 {
+						decoded := decodeZRLEInPlace(msg, *info)
+						if decoded == nil {
+							frameBuf = frameBuf[msgLen:]
+							continue
+						}
+						msg = decoded
+					}
+
 					if err := wsConn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
 						log.Printf("WS write ended: %v", err)
 						done <- struct{}{}
